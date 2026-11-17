@@ -7,7 +7,8 @@
     uv run train.py --all --parallel 4                           # 4 runs at a time on the GPU
     uv run train.py --clean                                      # delete the runs and results/
 
-A run writes runs/<experiment>/<model>/seed_<n>/: train.json (protocol, history, time), scores.npz
+A run writes runs/<experiment>/<model>/seed_<n>/: train.log (its output), train.json (protocol, per-epoch
+history: losses, validation AP, learning rate, time), scores.npz
 (the scores evaluate.py reads), and for causal ViTs export/ (the INT8 C, firmware/). A finished run
 is skipped, so an interrupted batch resumes where it stopped.
 
@@ -28,6 +29,7 @@ Experiments (models.yaml):
 import argparse
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -40,6 +42,8 @@ import numpy as np
 import yaml
 
 from paths import DATA, ROOT, RUNS
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # TensorFlow's C++ logs (PolyChirp sets the same, later)
 
 CONFIG = yaml.safe_load((ROOT / "models.yaml").read_text())
 P = CONFIG["protocol"]
@@ -82,14 +86,40 @@ def seed_everything(seed: int) -> None:
     keras.utils.set_random_seed(seed)
 
 
+RUN = ""  # "[experiment model s<seed>]", set by run_one: every line of a run starts with it (runs in parallel interleave)
+
+
+def say(text: str) -> None:
+    for line in text.split("\n"):
+        print(f"{RUN} {line}" if RUN else line, flush=True)
+
+
+def log_epoch(history: list, epoch: int, train_loss: float, val_loss: float, ap: float, best_ap: float, best_epoch: int,
+              lr: float, seconds: float, improved: bool, new_lr: float, stop: bool) -> None:
+    """One line per epoch, the same for every model (PolyChirp's too, baselines.py), and its history entry:
+    the losses are the training loss (binary cross-entropy, sample weights included), the validation
+    AP the selection score; * marks the epochs that improved it (the weights kept)."""
+    history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_ap": ap, "lr": lr,
+                    "seconds": seconds, "improved": improved})
+    line = (f"e{epoch}/{P['epochs']}  train {train_loss:.4f}  val {val_loss:.4f}  AP {ap:.4f}{' *' if improved else '  '}  "
+            f"best {best_ap:.4f} (e{best_epoch})  lr {lr:.1e}  {seconds:.0f}s")
+    if new_lr < lr:
+        line += f"  -> lr {new_lr:.1e}"
+    if stop:
+        line += f"\nstop at epoch {epoch}" + (f" (no gain for {P['patience']} epochs)" if epoch < P["epochs"] else "") + \
+                f": best AP {best_ap:.4f} at epoch {best_epoch}"
+    say(line)
+
+
 class Protocol:
     """models.yaml's protocol on a score to minimize (minus the validation AP), the same for PyTorch
     and Keras: step() says whether the epoch improved, whether to halve the learning rate, whether to stop."""
 
     def __init__(self):
         self.best, self.best_epoch, self.bad, self.lr_bad, self.history = math.inf, 0, 0, 0, []
+        self.t = time.time()
 
-    def step(self, epoch: int, score: float, **logged) -> tuple[bool, bool, bool]:
+    def step(self, epoch: int, score: float, lr: float, train_loss: float, val_loss: float) -> tuple[bool, bool, bool]:
         improved = score < self.best - P["min_delta"]
         if improved:
             self.best, self.best_epoch, self.bad, self.lr_bad = score, epoch, 0, 0
@@ -98,14 +128,27 @@ class Protocol:
         reduce = self.lr_bad >= P["lr_patience"]
         if reduce:
             self.lr_bad = 0
-        self.history.append({"epoch": epoch + 1, "val_ap": -score, **logged})
-        print(f"e{epoch + 1} val AP {-score:.4f} (best {-self.best:.4f})" + "".join(f" {k} {v:.4g}" for k, v in logged.items()), flush=True)
-        return improved, reduce, self.bad >= P["patience"]
+        stop = self.bad >= P["patience"] or epoch + 1 == P["epochs"]
+        seconds, self.t = time.time() - self.t, time.time()
+        log_epoch(self.history, epoch + 1, train_loss, val_loss, -score, -self.best, self.best_epoch + 1, lr, seconds,
+                  improved, max(lr * P["lr_factor"], P["lr_min"]) if reduce else lr, stop)
+        return improved, reduce, stop
 
 
-def torch_step(model, protocol: Protocol, opt, epoch: int, score: float, best: dict, **logged) -> bool:
+def bce(z: np.ndarray, y: np.ndarray) -> float:
+    """Mean binary cross-entropy of logits z against targets y (the training loss, on the validation set)."""
+    return float(np.mean(np.logaddexp(0, z) - y * z))
+
+
+def note(t0: float, text: str) -> None:
+    """A step of a run, with the time since its start."""
+    m = int(time.time() - t0) // 60
+    say(f"{m // 60}h{m % 60:02d}  {text}")
+
+
+def torch_step(model, protocol: Protocol, opt, epoch: int, score: float, best: dict, **losses) -> bool:
     """Protocol step for a PyTorch model: keeps the best weights, halves the learning rate; True to stop."""
-    improved, reduce, stop = protocol.step(epoch, score, lr=opt.param_groups[0]["lr"], **logged)
+    improved, reduce, stop = protocol.step(epoch, score, opt.param_groups[0]["lr"], **losses)
     if improved:
         best.update({k: v.detach().clone() for k, v in model.state_dict().items()})
     if reduce:
@@ -164,19 +207,32 @@ def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
     logits = lambda x: model(x, m_init=m0.expand(len(x), -1))  # noqa: E731
     opt = torch.optim.Adam(model.parameters(), lr=P["lr"], eps=P["adam_eps"])
     protocol, best = Protocol(), {}
+    def loss_sum(x, y, w):   # PolyChirp's weighted loss, summed over the clips (the readout of training)
+        return (w * F.binary_cross_entropy_with_logits(clip_logits(logits(x), True), y, reduction="none").mean(1)).sum()
+
+    def tensors(audio, y, w):
+        return (torch.from_numpy(a).to(dev) for a in (vit_input(audio), np.array(y, np.float32), np.array(w, np.float32)))
+    note(t0, f"training on {torch_name(dev)}")
     for epoch in range(P["epochs"]):
         model.train()
-        for audio, y, w in train_ds:
-            x, y, w = (torch.from_numpy(a).to(dev) for a in (vit_input(audio), np.asarray(y, np.float32), np.asarray(w, np.float32)))
-            loss = (w * F.binary_cross_entropy_with_logits(clip_logits(logits(x), True), y, reduction="none").mean(1)).sum() / len(x)
+        total, n = torch.zeros((), device=dev), 0
+        for batch in train_ds:
+            x, y, w = tensors(*batch)
+            loss = loss_sum(x, y, w) / len(x)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
+            total, n = total + loss.detach() * len(x), n + len(x)
         model.eval()
+        z, y, val_total, val_n = [], [], 0.0, 0
         with torch.no_grad():
-            z, y = zip(*((clip_logits(logits(torch.from_numpy(vit_input(a)).to(dev)), True).cpu().numpy(), np.asarray(t))
-                         for a, t, *_ in val_ds))
-        if torch_step(model, protocol, opt, epoch, -average_precision_score(np.concatenate(y), np.concatenate(z), average="macro"), best):
+            for batch in val_ds:
+                x, t, w = tensors(*batch)
+                z.append(clip_logits(logits(x), True).cpu().numpy())
+                y.append(np.asarray(batch[1]))
+                val_total, val_n = val_total + float(loss_sum(x, t, w)), val_n + len(x)
+        if torch_step(model, protocol, opt, epoch, -average_precision_score(np.concatenate(y), np.concatenate(z), average="macro"), best,
+                      train_loss=float(total) / n, val_loss=val_total / val_n):
             break
     model.load_state_dict(best)
     model.eval()
@@ -195,6 +251,7 @@ def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
             spec = model.spectrogram(calib, m_init=m0.expand(len(calib), -1)).cpu()
         export.write_c(model, spec, m0, out / "export", tag=f"{model_name} seed {seed}")
         binary = export.build_host(out / "export")
+        note(t0, "INT8 export done (export/)")
 
     def scores(datasets):
         y, fz, qz, pending = [], [], [], []
@@ -218,6 +275,7 @@ def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
         return np.concatenate(y), np.concatenate(fz), np.concatenate(qz) if qz else None
     result = {"label_names": np.array(labels)}
     for split, datasets in (("train", (tune_ds, val_ds)), ("test", (test_ds,))):
+        note(t0, f"scoring the {'tuning set (train + val)' if split == 'train' else 'test set'}, float" + (" and INT8" if binary else ""))
         y, f, q = scores(datasets)
         result |= {f"y_true_{split}": y, f"y_score_float_{split}": f} | ({f"y_score_quant_{split}": q} if q is not None else {})
     np.savez_compressed(out / "scores.npz", **result)
@@ -228,10 +286,13 @@ def train_classification(model: str, seed: int, out: Path) -> None:
     if model.startswith("vit_"):
         train_vit_classification(model, seed, out)
     else:
+        import functools
         import baselines
-        t0 = time.time()
-        baselines.train_classification(model, seed, out, P)  # results.npz: the same keys as scores.npz
-        (out / "train.json").write_text(json.dumps({"protocol": P, "seconds": time.time() - t0, "trainer": "PolyChirp"}))
+        t0, history = time.time(), []
+        baselines.train_classification(model, seed, out, P, functools.partial(log_epoch, history))  # results.npz: scores.npz's keys
+        best = [h["epoch"] for h in history if h["improved"]]
+        (out / "train.json").write_text(json.dumps({"protocol": P, "epochs": len(history), "best_epoch": best[-1] if best else None,
+                                                    "seconds": time.time() - t0, "history": history, "trainer": "PolyChirp"}, indent=1))
 
 
 # --- detection: data -------------------------------------------------------------------------------------
@@ -365,9 +426,9 @@ class Detector:
     def load(self, state) -> None:
         self.model.load_state_dict(state) if self.vit else self.model.set_weights(state)
 
-    def step(self, protocol: Protocol, epoch: int, score: float, best: list) -> bool:
+    def step(self, protocol: Protocol, epoch: int, score: float, best: list, **losses) -> bool:
         lr = self.opt.param_groups[0]["lr"] if self.vit else float(self.model.optimizer.learning_rate.numpy())
-        improved, reduce, stop = protocol.step(epoch, score, lr=lr)
+        improved, reduce, stop = protocol.step(epoch, score, lr, **losses)
         if improved:
             best[:] = [self.state()]
         if reduce:
@@ -442,31 +503,36 @@ def train_detection(experiment: str, model_name: str, seed: int, out: Path) -> N
     if det.window:
         vr, vb, vy = window_targets(val_labels)
     protocol, best = Protocol(), []
+    note(t0, f"training on {torch_name(det.dev) if det.vit else tensorflow_name()}: {EPOCH_HOURS} h of audio per epoch, "
+             f"{len(data['train'].names)} train / {len(data['val'].names)} val recordings")
     for epoch in range(P["epochs"]):
         audio, labels = data["train"].region_batch(data["train"].regions(n_regions(EPOCH_HOURS), regions_rng))
+        losses = []
         if det.window:  # one window per decision, shuffled across regions
             r, b, y = window_targets(labels, order_rng)
             order = order_rng.permutation(len(r))
             for k in range(0, len(order), P["batch_size"]):
                 i = order[k:k + P["batch_size"]]
-                det.fit_batch(window_audio(audio, b[i], r[i], det.samples), y[i])
+                losses.append(det.fit_batch(window_audio(audio, b[i], r[i], det.samples), y[i]))
             z = np.concatenate([det.logits(window_audio(val_audio, vb[k:k + 512], vr[k:k + 512], det.samples)) for k in range(0, len(vr), 512)])
             y_val = vy
         else:           # whole regions, the loss on every buffer after the receptive field
             for k in range(0, len(audio), P["batch_size"]):
-                det.fit_batch(audio[k:k + P["batch_size"]], labels[k:k + P["batch_size"]], warmup)
+                losses.append(det.fit_batch(audio[k:k + P["batch_size"]], labels[k:k + P["batch_size"]], warmup))
             z = np.concatenate([det.logits(val_audio[k:k + 32])[:, warmup:] for k in range(0, len(val_audio), 32)]).ravel()
             y_val = val_labels[:, warmup:].ravel()
             z, y_val = z[y_val != IGNORE], y_val[y_val != IGNORE]
-        if det.step(protocol, epoch, -average_precision_score(y_val, z), best):
+        if det.step(protocol, epoch, -average_precision_score(y_val, z), best, train_loss=float(np.mean(losses)), val_loss=bce(z, y_val)):
             break
     det.load(best[0])
     out.mkdir(parents=True, exist_ok=True)
+    note(t0, "INT8 version" + (" (export/)" if det.vit else " (model.tflite)"))
     # INT8 calibration from the validation days: 240 windows for the ViT (export.py), 2000 for PolyChirp's TFLite recipe
     det.quantize(data["val"].clips(CONFIG["vit"]["calibration_clips"] if det.vit else 2000, det.samples, np.random.default_rng(2)), out)
     scores = {}
     for split in ("val", "ssw_test", "sne_test"):
         d = data[split]
+        note(t0, f"scoring {split}: {len(d.names)} recordings, float" + (" and INT8" if det.binary or det.tflite else ""))
         for name, audio, n in zip(d.names, d.audio, d.buffers):
             if det.window:  # decisions at buffers 46, 69, ...; NaN between them
                 b = np.arange(SPAN - 1, n, EVERY)
@@ -505,10 +571,36 @@ def torch_device():
     for arch in torch.cuda.get_arch_list():   # sm_XY runs on X.Y and later minors; compute_XY (PTX) on X.Y and later
         kind, cc = arch.split("_")
         if (int(cc) // 10 == major and int(cc) % 10 <= minor) or (kind == "compute" and divmod(int(cc), 10) <= (major, minor)):
-            return torch.device("cuda")
-    print(f"{torch.cuda.get_device_name(0)} (compute capability {major}.{minor}): this PyTorch build has no kernels "
-          f"for it ({', '.join(torch.cuda.get_arch_list())}), the ViT trains on the CPU", flush=True)
+            return torch.device("cuda", 0)
+    say(f"{torch.cuda.get_device_name(0)} (compute capability {major}.{minor}): this PyTorch build has no kernels "
+        f"for it ({', '.join(torch.cuda.get_arch_list())}), the ViT trains on the CPU")
     return torch.device("cpu")
+
+
+def torch_name(dev) -> str:
+    import torch
+    return f"the GPU ({torch.cuda.get_device_name(dev)}, PyTorch)" if dev.type == "cuda" else "the CPU (PyTorch)"
+
+
+def tensorflow_name() -> str:
+    import tensorflow as tf
+    return f"the {'GPU' if tf.config.list_logical_devices('GPU') else 'CPU'} (TensorFlow)"
+
+
+class Tee:
+    """stdout to the terminal and to the run's train.log."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for st in self.streams:
+            st.write(text)
+        return len(text)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
 
 
 def tensorflow_gpu_ok() -> bool:
@@ -516,7 +608,7 @@ def tensorflow_gpu_ok() -> bool:
     Blackwell (12.x) fails at the first kernel."""
     import torch
     if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 10:
-        print(f"{torch.cuda.get_device_name(0)}: TensorFlow 2.16 cannot run on this GPU, PolyChirp's models train on the CPU")
+        say(f"{torch.cuda.get_device_name(0)}: TensorFlow 2.16 cannot run on this GPU, PolyChirp's models train on the CPU")
         return False
     return True
 
@@ -526,18 +618,23 @@ def run_one(experiment: str, model: str, seed: int) -> None:
     if (out / "train.json").exists():
         print(f"{out}: done")
         return
-    print(f"=== {experiment} {model} seed {seed}", flush=True)
+    global RUN
+    RUN = f"[{experiment} {model} s{seed}]"
+    tmp = out.with_name(out.name + ".partial")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    sys.stdout = Tee(sys.__stdout__, open(tmp / "train.log", "w"))
+    say(f"=== {experiment} {model} seed {seed}")
     if model.startswith("vit_") or not tensorflow_gpu_ok():
         # the ViT: TensorFlow only reads PolyChirp's data, the GPU is PyTorch's. PolyChirp's models on a GPU
         # TensorFlow 2.16 has no kernels for (Blackwell, compute capability 12): on the CPU, slower.
         import tensorflow as tf
         tf.config.set_visible_devices([], "GPU")
     seed_everything(seed)
-    tmp = out.with_name(out.name + ".partial")
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
+    t0 = time.time()
     (train_classification(model, seed, tmp) if experiment == "classification" else train_detection(experiment, model, seed, tmp))
     tmp.rename(out)
+    note(t0, f"=== done: {out}")
 
 
 def main():

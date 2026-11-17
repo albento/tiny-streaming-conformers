@@ -35,11 +35,13 @@ def species(catalog, seed: int) -> tuple[list[int], int]:
     return np.random.default_rng([seed, K, 0]).choice(pool, K, replace=False).tolist(), catalog.class_names.index("non_target")
 
 
+
 # --- classification: PolyChirp's own training, with the paper's protocol ---------------------------
 
-def install_protocol(runner) -> None:
+def install_protocol(runner, log) -> None:
     """Replaces, in PolyChirp's runner.train_cell, the compared validation loss by minus the
-    validation macro AP (source checked, so that a change upstream fails loudly)."""
+    validation macro AP, and its epoch line by log (train.py's: losses, AP, learning rate, time).
+    The source is checked, so that a change upstream fails loudly."""
     from sklearn.metrics import average_precision_score
 
     def val_macro_ap(batches):
@@ -47,28 +49,73 @@ def install_protocol(runner) -> None:
         return float(average_precision_score(y, np.concatenate([b[1] for b in batches]), average="macro"))
     src = inspect.getsource(runner.train_cell)
     for old, new in (
+        ('        cell_tag = f"[scale] s{sample_idx} k{k}"\n',
+         '        cell_tag = f"[scale] s{sample_idx} k{k}"\n        best_epochs: dict = {}\n'),
+        ("            t_train = perf_counter()\n",
+         "            t_train = perf_counter()\n            train_losses: dict = {}\n            epoch_log: dict = {}\n"),
+        ("                    s.model.train_on_batch(feats[s.spec.input_frontend], y, sample_weight=sw)\n",
+         "                    train_losses.setdefault(id(s), []).append(float(np.ravel(s.model.train_on_batch(feats[s.spec.input_frontend], y, sample_weight=sw))[0]))\n"),
         ("            val_losses: dict[int, list[float]] = {id(s): [] for s in active}\n",
          "            val_losses: dict[int, list[float]] = {id(s): [] for s in active}\n            val_preds: dict = {}\n"),
         ("                    out = s.model.test_on_batch(feats[s.spec.input_frontend], y, sample_weight=sw)\n",
          "                    out = s.model.test_on_batch(feats[s.spec.input_frontend], y, sample_weight=sw)\n"
          "                    val_preds.setdefault(id(s), []).append((np.asarray(y), np.asarray(s.model.predict_on_batch(feats[s.spec.input_frontend]))))\n"),
         ("                vloss = float(np.mean(val_losses[id(s)])) if val_losses[id(s)] else math.inf\n",
-         "                vloss = -val_macro_ap(val_preds[id(s)])  # minimized\n"),
+         "                vloss = -val_macro_ap(val_preds[id(s)])  # minimized\n"
+         "                epoch_log[id(s)] = (float(np.mean(train_losses[id(s)])), float(np.mean(val_losses[id(s)])), -vloss,\n"
+         "                                    float(tf.keras.backend.get_value(s.model.optimizer.learning_rate)))\n"),
+        (  # PolyChirp's epoch line -> train.py's
+         '            bests = " ".join(\n'
+         '                f"{s.spec.name}x{s.spec.multi:g}={s.best_val_loss:.4f}"\n'
+         '                + (" [stop]" if s.stopped else "")\n'
+         '                for s in active\n'
+         '            )\n'
+         '            detail = ""\n'
+         '            if FIT_VERBOSE:\n'
+         '                steps = " ".join(\n'
+         '                    f"{s.spec.name}x{s.spec.multi:g}={t_step[id(s)]:.1f}s" for s in active\n'
+         '                )\n'
+         '                detail = f"data={t_data:.1f}s feat={t_feat:.1f}s {steps} "\n'
+         '            tqdm.write(\n'
+         '                f"{cell_tag} e{epoch + 1}/{config.epochs} "\n'
+         '                f"train={train_elapsed:.1f}s val={val_elapsed:.1f}s {detail}| {bests}"\n'
+         '            )\n',
+         "            for s in active:\n"
+         "                train_loss, val_loss, ap, lr = epoch_log[id(s)]\n"
+         "                if s.epochs_no_improve == 0:\n"
+         "                    best_epochs[id(s)] = epoch + 1\n"
+         "                log(epoch + 1, train_loss, val_loss, ap, -s.best_val_loss, best_epochs[id(s)], lr, train_elapsed + val_elapsed,\n"
+         "                    s.epochs_no_improve == 0, float(tf.keras.backend.get_value(s.model.optimizer.learning_rate)),\n"
+         "                    s.stopped or epoch + 1 == config.epochs)\n"),
     ):
         assert src.count(old) == 1, f"PolyChirp's train_cell changed: {old.strip()!r}"
         src = src.replace(old, new)
-    namespace = dict(vars(runner), val_macro_ap=val_macro_ap)
+    namespace = dict(vars(runner), val_macro_ap=val_macro_ap, log=log)
     exec(compile(src, inspect.getsourcefile(runner.train_cell), "exec"), namespace)
     runner.train_cell = namespace["train_cell"]
 
 
-def train_classification(name: str, seed: int, run_dir: Path, protocol: dict) -> None:
+def quiet_export() -> None:
+    """PolyChirp's TFLite recipe exports a SavedModel first, and Keras lists its ~200 captured tensors
+    in the log: off by default (verbose=False unless asked)."""
+    import keras
+    if not getattr(keras.Model.export, "quiet", False):
+        export = keras.Model.export
+
+        def quiet(self, filepath, format="tf_saved_model", verbose=False, **kwargs):
+            return export(self, filepath, format=format, verbose=verbose, **kwargs)
+        quiet.quiet = True
+        keras.Model.export = quiet
+
+
+def train_classification(name: str, seed: int, run_dir: Path, protocol: dict, log) -> None:
     """One run of PolyChirp's scale benchmark (k = 10, one cell): PolyChirp trains, tunes the per-class
     thresholds, quantizes to INT8 TFLite and writes results.npz (every clip's float and INT8 scores on
-    the tuning set, train + val, and on the test set) into run_dir."""
+    the tuning set, train + val, and on the test set) into run_dir. log(epoch, ...): train.py's epoch line."""
     import keras
     from building.polychirp_training import runner
-    install_protocol(runner)
+    install_protocol(runner, log)
+    quiet_export()
     runner.scale_run_dir = lambda *args: run_dir
     keras.utils.set_random_seed(seed)
     config = runner.ScaleGridConfig(collection=COLLECTION, specs=[specs()[name]], epochs=protocol["epochs"],
@@ -83,4 +130,5 @@ def build_detector(name: str):
     """(Keras model with one sigmoid output, its front end: audio [n, 48000] in [-1, 1] -> features)."""
     from building.polychirp_training.training import featurize
     spec = specs()[name]
+    quiet_export()
     return spec.builder(1), lambda audio: featurize(audio, spec.input_frontend)

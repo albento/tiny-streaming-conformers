@@ -26,6 +26,7 @@ peak tensor arena, plus the 3 s of audio they need).
 import csv
 import json
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -36,6 +37,8 @@ import numpy as np
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 
 from paths import DATA, ROOT, RUNS
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # TensorFlow's C++ logs (PolyChirp sets the same, later)
 
 RESULTS = ROOT / "results"
 B, SR = 1024, 16000
