@@ -221,3 +221,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# tiny-streaming-conformers: training runs (weights, scores) and datasets are not versioned;
+# results/ (CSV and figures) is
+runs/
+data/
+*.partial/
+# .env is versioned with empty values (the default folders); set your own paths in it
+!.env

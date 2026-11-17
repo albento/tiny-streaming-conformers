@@ -1,0 +1,18 @@
+[submodule "polychirp"]
+	path = polychirp
+	url = https://github.com/NathanDuboisset/PolyChirp.git
+[submodule "firmware/CMSIS-DSP"]
+	path = firmware/CMSIS-DSP
+	url = https://github.com/ARM-software/CMSIS-DSP.git
+[submodule "firmware/CMSIS-NN"]
+	path = firmware/CMSIS-NN
+	url = https://github.com/ARM-software/CMSIS-NN.git
+[submodule "firmware/CMSIS_6"]
+	path = firmware/CMSIS_6
+	url = https://github.com/ARM-software/CMSIS_6.git
+[submodule "firmware/AudioMoth-Firmware-Basic"]
+	path = firmware/AudioMoth-Firmware-Basic
+	url = https://github.com/OpenAcousticDevices/AudioMoth-Firmware-Basic.git
+[submodule "firmware/AudioMoth-Project"]
+	path = firmware/AudioMoth-Project
+	url = https://github.com/OpenAcousticDevices/AudioMoth-Project.git

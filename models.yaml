@@ -1,0 +1,45 @@
+# Every model and experiment of the paper. train.py reads this file; nothing else defines a model.
+
+# Training protocol of every model (PolyChirp's scale grid, the checkpoint chosen on the validation
+# macro average precision): Adam (Keras defaults), the learning rate halved after 3 epochs without
+# a gain > min_delta (floor 1e-5), training stopped after `patience` such epochs, best weights kept.
+protocol:
+  epochs: 100
+  batch_size: 32
+  lr: 1.0e-3
+  adam_eps: 1.0e-7
+  lr_patience: 3
+  lr_factor: 0.5
+  lr_min: 1.0e-5
+  patience: 10
+  min_delta: 1.0e-4
+
+# Our ViT (vit.py). A model id is vit_<stem>_l<layers>[_nc]: e.g. vit_s24_l3, vit_s27_l1_nc (non-causal).
+vit:
+  layers: [1, 2, 3]
+  stems:
+    s24:   # 5x5 kernel, stride 2 (frequency) x 4 (frames): one token per 4 frames of 8 ms (~37 ms)
+      {channels: 8, freq_kernel: 5, freq_stride: 2, time_kernel: 5, time_stride: 4}
+    s27:   # 5x7 kernel, stride 2 x 7, aligned on the buffers: one token per 64 ms buffer
+      {channels: 8, freq_kernel: 5, freq_stride: 2, time_kernel: 7, time_stride: 7, aligned: true}
+  architecture: {dim: 32, heads: 4, ffn: 128, context: 32, conv_kernel: 7, dropout: 0.1}
+  pcen_seed_clips: 2000          # PCEN's running mean starts at the mean training power (as the device)
+  readout: {tau_s: 0.5, skip: 5, temperature: 5.0}   # vit.clip_logits / vit.window_logit
+  calibration_clips: 240         # INT8 calibration (export.py), drawn from the validation split
+
+# PolyChirp's models (baselines.py), each on the front end PolyChirp assigns it.
+baselines: [mel_polychirp_x2, mel_polychirp_x3, wrennet]
+
+# The experiments: which models each one trains (the ViT ids are expanded over stems, layers and
+# causality as listed).
+experiments:
+  classification:              # PolyChirp's Paris benchmark: 10 species, 3 s clips
+    vit: {stems: [s24, s27], causal: [true, false]}
+    baselines: [mel_polychirp_x2, mel_polychirp_x3, wrennet]
+  detection_stream:            # bird / no bird every 64 ms, streamed as on the device (INT8)
+    vit: {stems: [s24, s27], causal: [true]}
+  detection_window:            # bird / no bird in each 3 s window, a decision every 1.47 s (float)
+    vit: {stems: [s24, s27], causal: [true, false]}
+    baselines: [mel_polychirp_x2, mel_polychirp_x3, wrennet]
+
+runs: 10                       # seeds 0 .. runs - 1

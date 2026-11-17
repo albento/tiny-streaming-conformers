@@ -1,2 +1,232 @@
 # tiny-streaming-conformers
-Benchmark repository for the paper "Tiny streaming Conformers for real-time bird species detection on resource-contrained acoustic recorders", submitted at ESANN27
+
+Code and results of the paper "Tiny streaming Conformers for real-time bird sound detection on
+low-resource acoustic recorders" (submitted to ESANN 2027): a streaming Conformer-like ViT that decides
+every 64 ms on the AudioMoth (Cortex-M4F, 48 MHz, 32 KB RAM), compared with PolyChirp's models on
+bird species classification and on bird / no-bird detection in long recordings.
+
+## Contents
+
+| File | What it does |
+|---|---|
+| `models.yaml` | every model, experiment and the training protocol |
+| `.env`, `paths.py` | where the data and runs go (default: inside the repository) |
+| `vit.py` | our ViT (PyTorch), nothing else |
+| `baselines.py` | PolyChirp's models (Mel-PolyChirp ×2 / ×3, WrenNet) and our changes to PolyChirp |
+| `prepare_classification.py` | builds PolyChirp's Paris dataset |
+| `prepare_detection.py` | downloads and labels the SSW / SNE soundscapes |
+| `train.py` | trains any model of any experiment |
+| `evaluate.py` | runs → CSV (`results/*_runs.csv`, `results/costs.csv`) |
+| `aggregate.py` | CSV → mean ± standard error per model (`results/*_summary.csv`) |
+| `plot.py` | figures (`results/figures/`) |
+| `export.py` | INT8 export of the ViT to C, host inference, AudioMoth firmware |
+| `firmware/` | the ViT and front end in C; AudioMoth, CMSIS as submodules |
+| `polychirp/` | PolyChirp (submodule, never modified) |
+
+`results/` holds the CSV and figures of the paper. `runs/` (weights, scores) and `data/` are not
+versioned; `.env` can move them out of the repository ([Where the data go](#where-the-data-go)).
+
+## Setup
+
+```sh
+git clone --recursive git@github.com:albento/tiny-streaming-conformers.git
+cd tiny-streaming-conformers
+uv sync                          # .venv: Python 3.12, PyTorch, TensorFlow 2.16, PolyChirp
+source .venv/bin/activate        # or prefix every command with `uv run`
+```
+
+- GPU: tested on an NVIDIA L40S. On Blackwell GPUs (compute capability 12), PolyChirp's TensorFlow
+  2.16 has no kernels: the ViT still trains on the GPU, PolyChirp's models fall back to the CPU.
+- `gcc` (host inference of the INT8 ViT) and, for the firmware and the RAM figures,
+  `arm-none-eabi-gcc` on the `PATH`.
+- `XC_API_KEY=<your Xeno-Canto API key>` in `polychirp/.env` (classification data only).
+
+### Where the data go
+
+`.env` sets the large folders; an empty variable keeps the default, inside the repository. Fill it
+before preparing the data, e.g. on a cluster whose home is small:
+
+```sh
+DATA_DIR=/scratch/me/tsc/data                # detection data, ~64 GB (default data/)
+RUNS_DIR=/scratch/me/tsc/runs                # runs, a few GB (default runs/)
+POLYCHIRP_DATA_DIR=/scratch/me/tsc/polychirp # classification data and its cache, ~22 GB (default inside polychirp/)
+```
+
+PolyChirp's code only reads its own folders, so `polychirp/raw_dataset/`,
+`polychirp/datasets/scale_49_2_r50/` and its decoded-audio cache (`polychirp/.cache/dataset_cache/`)
+become links to `POLYCHIRP_DATA_DIR`. Give each variable a
+folder of its own: `train.py --clean` deletes the runs in `RUNS_DIR`. uv's own large folders are set
+in the shell, before `uv sync`:
+
+```sh
+export UV_CACHE_DIR=/scratch/me/uv-cache            # uv's download cache (default ~/.cache/uv)
+export UV_PROJECT_ENVIRONMENT=/scratch/me/tsc/venv  # the virtualenv, ~12 GB (default .venv/); activate it there
+```
+
+## Data
+
+```sh
+uv run prepare_classification.py     # PolyChirp's Paris dataset, into polychirp/ (git-ignored folders)
+uv run prepare_detection.py          # SSW + SNE: ~31 GB downloaded, ~60 GB on disk, into data/
+```
+
+Both resume where they stopped.
+
+Data already prepared on another machine can be copied instead (`-L`: PolyChirp's dataset is links
+into `raw_dataset/`; the FLAC files are only needed by `prepare_detection.py`):
+
+```sh
+rsync -aL --mkpath --exclude audio/ data/ <host>:<DATA_DIR>/
+rsync -aL --mkpath polychirp/datasets/scale_49_2_r50 <host>:<POLYCHIRP_DATA_DIR>/datasets/
+rsync -aL --mkpath polychirp/raw_dataset/audioset <host>:<POLYCHIRP_DATA_DIR>/raw_dataset/   # augmentation noise
+```
+
+**Classification**: PolyChirp's dataset of 3 s clips at 16 kHz around Paris, built by PolyChirp's own
+code, with 10 target species (the paper's, fixed) and a `non_target` class (23 other species of the
+area, BirdNET-mined clips without birds, AudioSet ambient sounds). Changes to PolyChirp's notebook:
+Xeno-Canto only (the Macaulay Library is behind a bot check) and AudioSet from its Hugging Face copy
+(YouTube blocks downloads). Xeno-Canto changes over time: a rebuild has the same species and budgets,
+not the same clips.
+
+**Detection**: the Cornell Lab's fully annotated soundscapes (Kahl et al., Zenodo, CC BY 4.0), part
+of BirdSet. SSW (Sapsucker Woods, 285 h) is split by recording day into train / val / test (≈ 70 /
+15 / 15 %, seed 42); SNE (Sierra Nevada, 33 h) is a test set from a site never seen in training.
+
+### Labels
+
+One label per 64 ms buffer: bird, no bird, or uncertain (left out of training and metrics). The
+annotators drew boxes (time × frequency) around calls but could merge calls of a species less than
+5 s apart, so a box often spans silent gaps. Inside each box, `prepare_detection.py` keeps as bird
+only the 10 ms frames where the box's band rises above the local noise:
+
+1. spectrogram: 512-point STFT, 10 ms hop, power averaged over 50 ms × 3 bins, in dB;
+2. noise floor per frequency bin: the median over the frames outside every box within ±30 s;
+3. per frame of a box: SNR = mean of the 3 strongest bins of the box's band (clipped to 150 Hz –
+   8 kHz) minus the floor; bird when SNR ≥ 6 dB;
+4. clean-up: runs < 50 ms dropped, gaps < 200 ms filled, runs widened by 50 ms, the box's best frame
+   always kept; boxes < 1 s kept whole;
+5. a buffer is bird if a bird frame falls in it, else uncertain if a box covers it, else no bird.
+
+SSW: 18.4 % bird, 4.8 % uncertain; SNE: 33.4 % bird, 16.3 % uncertain. Inspect any stretch with
+`uv run plot.py labels <recording> --start <s> --end <s>`.
+
+## Models
+
+Our ViT, `vit_<stem>_l<layers>[_nc]`: learned PCEN front end (STFT per 64 ms buffer), a convolutional
+stem, then per layer a Conformer-style convolution module (depthwise, kernel 7) and a Transformer
+encoder layer with ALiBi attention (dim 32, 4 heads, FFN 128).
+
+| Option | Values |
+|---|---|
+| stem | `s24`: 5×5, stride 2×4 (a token every ~37 ms); `s27`: 5×7, stride 2×7 (a token per 64 ms buffer) |
+| layers | 1, 2, 3 |
+| `_nc` | non-causal (float reference); default causal: streams on the AudioMoth, attention on the last 32 tokens |
+
+PolyChirp's models, each on the front end PolyChirp's code assigns it: `mel_polychirp_x2`,
+`mel_polychirp_x3`, `wrennet`.
+
+| Experiment | Task | Models |
+|---|---|---|
+| `classification` | 10 species, 3 s clips (PolyChirp's benchmark) | 12 ViTs + 3 baselines |
+| `detection_stream` | bird / no bird every 64 ms, streamed as on the device (INT8) | 6 causal ViTs |
+| `detection_window` | bird / no bird in each 3 s window, a decision every 1.47 s (all models in the clip models' regime) | 12 ViTs + 3 baselines |
+
+Protocol, every model: Adam (lr 1e-3), batch 32, the checkpoint with the best validation macro
+average precision (min delta 1e-4), learning rate halved after 3 epochs without gain, stop after 10,
+at most 100 epochs. Classification uses PolyChirp's data pipeline (clips, augmentation, class weights)
+for every model, and PolyChirp's own training for its models. Detection draws the same 30 s regions,
+decision times and window order for every model of a seed.
+
+## Training
+
+10 runs per model, seeds 0–9. A run goes to `runs/<experiment>/<model>/seed_<n>/`; finished runs are
+skipped, so any command resumes.
+
+```sh
+uv run train.py --all                     # everything (360 runs)
+uv run train.py --all --parallel 4        # 4 runs at a time on one GPU (each ViT run needs < 4 GB)
+uv run train.py classification --runs 10  # one experiment
+uv run train.py --list                    # what is done
+uv run train.py --clean                   # delete the runs and results/, to start again
+```
+
+One model at a time:
+
+```sh
+# classification
+uv run train.py classification vit_s24_l1 --runs 10
+uv run train.py classification vit_s24_l2 --runs 10
+uv run train.py classification vit_s24_l3 --runs 10
+uv run train.py classification vit_s27_l1 --runs 10
+uv run train.py classification vit_s27_l2 --runs 10
+uv run train.py classification vit_s27_l3 --runs 10
+uv run train.py classification vit_s24_l1_nc --runs 10
+uv run train.py classification vit_s24_l2_nc --runs 10
+uv run train.py classification vit_s24_l3_nc --runs 10
+uv run train.py classification vit_s27_l1_nc --runs 10
+uv run train.py classification vit_s27_l2_nc --runs 10
+uv run train.py classification vit_s27_l3_nc --runs 10
+uv run train.py classification mel_polychirp_x2 --runs 10
+uv run train.py classification mel_polychirp_x3 --runs 10
+uv run train.py classification wrennet --runs 10
+# detection_stream
+uv run train.py detection_stream vit_s24_l1 --runs 10
+uv run train.py detection_stream vit_s24_l2 --runs 10
+uv run train.py detection_stream vit_s24_l3 --runs 10
+uv run train.py detection_stream vit_s27_l1 --runs 10
+uv run train.py detection_stream vit_s27_l2 --runs 10
+uv run train.py detection_stream vit_s27_l3 --runs 10
+# detection_window
+uv run train.py detection_window vit_s24_l1 --runs 10
+uv run train.py detection_window vit_s24_l2 --runs 10
+uv run train.py detection_window vit_s24_l3 --runs 10
+uv run train.py detection_window vit_s27_l1 --runs 10
+uv run train.py detection_window vit_s27_l2 --runs 10
+uv run train.py detection_window vit_s27_l3 --runs 10
+uv run train.py detection_window vit_s24_l1_nc --runs 10
+uv run train.py detection_window vit_s24_l2_nc --runs 10
+uv run train.py detection_window vit_s24_l3_nc --runs 10
+uv run train.py detection_window vit_s27_l1_nc --runs 10
+uv run train.py detection_window vit_s27_l2_nc --runs 10
+uv run train.py detection_window vit_s27_l3_nc --runs 10
+uv run train.py detection_window mel_polychirp_x2 --runs 10
+uv run train.py detection_window mel_polychirp_x3 --runs 10
+uv run train.py detection_window wrennet --runs 10
+```
+
+## Evaluation
+
+```sh
+uv run evaluate.py      # results/classification_runs.csv, detection_runs.csv, costs.csv
+uv run aggregate.py     # results/classification_summary.csv, detection_summary.csv
+uv run plot.py          # results/figures/
+```
+
+- Classification (test clips): macro F2 at per-class thresholds tuned on train + val (PolyChirp's
+  evaluation), macro average precision, clip error (predicted set of species ≠ true set).
+- Detection (SSW test days, SNE), the first 8 s of every recording left out:
+  - segment ROC (AUC, AP) on common 1.47 s segments, positive when they overlap an annotation box; a
+    model's score is its highest decision judging the segment;
+  - the AudioMoth's triggered recording simulated on the scores (a recording starts with a
+    pre-roll and ends 1.5 s after the last detection): time recorded vs annotation boxes captured,
+    summarized as the time needed for 80 / 90 % of the boxes and the boxes captured with 20 / 30 % of
+    the time.
+- Float and INT8 for every model: the ViT's INT8 is its firmware C run on the host (`firmware/host_infer.c`),
+  PolyChirp's models' their INT8 TFLite model.
+- Costs: parameters, multiply-accumulates per second of audio (front end included), flash, RAM.
+- Summaries: mean over runs ± standard error (standard deviation / √runs).
+
+## AudioMoth firmware
+
+```sh
+uv run export.py runs/classification/vit_s24_l3/seed_0     # -> audiomoth_vit_s24_l3_seed_0.bin in that folder
+```
+
+The latency-measuring firmware: the official AudioMoth firmware (`firmware/AudioMoth-Firmware-Basic`,
+built with `firmware/AudioMoth-Project`) with the ViT added by `firmware/main.patch`. Flash it with the
+AudioMoth Flash App.
+
+## Reproducibility
+
+Seeds fix the data order, the initialisation and the augmentation; some GPU kernels are not
+deterministic, so a rerun matches closely, not bit for bit.
