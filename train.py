@@ -148,7 +148,7 @@ def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
     import export
     import vit
     t0 = time.time()
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch_device()
     train_ds, val_ds, test_ds, tune_ds, labels = classification_data(seed)
     model = make_vit(model_name, len(labels)).to(dev)
     r = CONFIG["vit"]["readout"]
@@ -306,7 +306,7 @@ class Detector:
         self.vit = name.startswith("vit_")
         if self.vit:
             import torch
-            self.torch, self.dev = torch, torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.torch, self.dev = torch, torch_device()
             self.model = make_vit(name, 1).to(self.dev)
             clips = train.clips(CONFIG["vit"]["pcen_seed_clips"], CLIP_SAMPLES, np.random.default_rng(0))
             with torch.no_grad():  # PCEN's seed: the mean training power per bin
@@ -494,6 +494,22 @@ def train_detection(experiment: str, model_name: str, seed: int, out: Path) -> N
 
 
 # --- command line -------------------------------------------------------------------------------------
+
+def torch_device():
+    """The GPU if this PyTorch build has kernels for it, else the CPU. PyTorch's CUDA 13 builds start at
+    compute capability 7.5: a V100 (7.0) is seen but fails at the first kernel."""
+    import torch
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    major, minor = torch.cuda.get_device_capability(0)
+    for arch in torch.cuda.get_arch_list():   # sm_XY runs on X.Y and later minors; compute_XY (PTX) on X.Y and later
+        kind, cc = arch.split("_")
+        if (int(cc) // 10 == major and int(cc) % 10 <= minor) or (kind == "compute" and divmod(int(cc), 10) <= (major, minor)):
+            return torch.device("cuda")
+    print(f"{torch.cuda.get_device_name(0)} (compute capability {major}.{minor}): this PyTorch build has no kernels "
+          f"for it ({', '.join(torch.cuda.get_arch_list())}), the ViT trains on the CPU", flush=True)
+    return torch.device("cpu")
+
 
 def tensorflow_gpu_ok() -> bool:
     """False on GPUs newer than PolyChirp's TensorFlow 2.16 (compiled up to compute capability 9.0):

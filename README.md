@@ -35,8 +35,9 @@ uv sync                          # .venv: Python 3.12, PyTorch, TensorFlow 2.16,
 source .venv/bin/activate        # or prefix every command with `uv run`
 ```
 
-- GPU: tested on an NVIDIA L40S. On Blackwell GPUs (compute capability 12), PolyChirp's TensorFlow
-  2.16 has no kernels: the ViT still trains on the GPU, PolyChirp's models fall back to the CPU.
+- GPU: tested on an NVIDIA L40S; needs an NVIDIA driver ≥ 580 (CUDA 13). Each framework falls back
+  to the CPU, with a message, on GPUs it has no kernels for: PolyChirp's TensorFlow 2.16 on Blackwell
+  (compute capability 12), our ViT's PyTorch on V100 and older (below 7.5).
 - `gcc` (host inference of the INT8 ViT) and, for the firmware and the RAM figures,
   `arm-none-eabi-gcc` on the `PATH`.
 - `XC_API_KEY=<your Xeno-Canto API key>` in `polychirp/.env` (classification data only).

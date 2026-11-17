@@ -14,6 +14,9 @@ dependencies = [
 
 [tool.uv]
 package = false
+# TensorFlow's NCCL (CUDA 12) and PyTorch's (CUDA 13) install the same file, nvidia/nccl/lib/libnccl.so.2:
+# keep PyTorch's. TensorFlow only loads NCCL for multi-GPU training, never used here.
+override-dependencies = ["nvidia-nccl-cu12 ; sys_platform == 'never'"]
 
 [tool.uv.sources]
 polychirp = { path = "polychirp", editable = true }
