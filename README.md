@@ -17,7 +17,7 @@ bird species classification and on bird / no-bird detection in long recordings.
 | `prepare_detection.py` | downloads and labels the SSW / SNE soundscapes |
 | `train.py` | trains any model of any experiment |
 | `evaluate.py` | runs → CSV (`results/*_runs.csv`, `results/costs.csv`) |
-| `aggregate.py` | CSV → mean ± standard error per model (`results/*_summary.csv`) |
+| `aggregate.py` | CSV → mean ± standard error per model (`results/*_summary.csv`), paired comparisons (`results/*_paired.csv`) |
 | `plot.py` | figures (`results/figures/`) |
 | `export.py` | INT8 export of the ViT to C, host inference, AudioMoth firmware |
 | `firmware/` | the ViT and front end in C; AudioMoth, CMSIS as submodules |
@@ -199,9 +199,14 @@ uv run train.py detection_window wrennet --runs 10
 
 ```sh
 uv run evaluate.py      # results/classification_runs.csv, detection_runs.csv, costs.csv
-uv run aggregate.py     # results/classification_summary.csv, detection_summary.csv
+uv run aggregate.py     # results/{classification,detection}_{summary,paired}.csv
 uv run plot.py          # results/figures/
 ```
+
+`*_paired.csv` compares every pair of models seed by seed (`diff_mean` = model_b − model_a, its 95 %
+confidence interval `diff_ci95`, the paired t-test's `p` and its Holm correction `p_holm` over the pairs
+of the same experiment, test set, float / INT8 and metric). The runs of two models share their seeds,
+so two models can differ clearly although the confidence intervals of their means overlap.
 
 `evaluate.py` is incremental: it adds the finished runs not in the CSV yet and keeps the rows already
 there, so runs evaluated on other machines can be gathered in one CSV (`--redo` evaluates again the

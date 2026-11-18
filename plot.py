@@ -1,11 +1,16 @@
 """Figures of the paper, from the runs and evaluate.py's curves, into results/figures/.
 
     uv run plot.py                                                  # every figure
+    uv run plot.py --ci                                             # with the 95 % confidence bands
     uv run plot.py labels SSW_102_20170415_161339Z --start 3153 --end 3171    # one stretch of a recording
 
-Classification: precision / recall on the test clips, every species and run pooled, float and INT8.
-Detection: the segment ROC (pooled over runs) and the boxes captured against the time recorded by the
-simulated triggered recorder (mean over runs). The models are grouped as the comparisons of the paper:
+Classification: precision / recall on the test clips, every species pooled, one figure for float and one
+for INT8, whole and zoomed on precision and recall >= 0.8 (*_zoom.png).
+Detection: the segment ROC and the boxes captured against the time recorded by the simulated triggered
+recorder. Every curve is the mean over the runs (each run's curve on a common grid). --ci adds its 95 %
+confidence interval as a band (Student's t, n - 1 degrees of freedom; none with one run): a check of the
+runs' spread, not a comparison of models, whose runs share their seeds (aggregate.py's *_paired.csv
+compares them seed by seed). The models are grouped as the comparisons of the paper:
 the causal ViTs with PolyChirp's models, and the non-causal ViTs with PolyChirp's models (the same
 regime: 3 s windows); for detection_stream, the causal ViTs alone (the device's regime).
 """
@@ -23,6 +28,20 @@ from paths import DATA, ROOT, RUNS  # noqa: E402
 
 FIGURES = ROOT / "results" / "figures"
 BASELINES = ("mel_polychirp_x2", "mel_polychirp_x3", "wrennet")
+GRID = np.linspace(0, 1, 201)
+CI = False  # --ci: the 95 % confidence bands
+ZOOM = (0.8, 1.002)  # precision and recall shown by the zoomed classification figures
+
+
+def mean_ci(ax, x, curves, label):
+    """The mean of the runs' curves (one per row, on x) and, with --ci, its 95 % confidence interval."""
+    from scipy import stats
+    c = np.asarray(curves)
+    m = c.mean(axis=0)
+    line, = ax.plot(x, m, label=label)
+    if CI and len(c) > 1:
+        h = stats.t.ppf(0.975, len(c) - 1) * c.std(axis=0, ddof=1) / np.sqrt(len(c))
+        ax.fill_between(x, m - h, m + h, color=line.get_color(), alpha=0.2, lw=0)
 
 
 def groups(experiment: str) -> dict[str, list[str]]:
@@ -40,30 +59,36 @@ def run_dirs(experiment: str, model: str) -> list[Path]:
 
 
 def classification():
+    """classification_pr_<group>_<float|int8>.png (the whole curves) and ..._zoom.png (ZOOM): one figure each."""
     from sklearn.metrics import precision_recall_curve
+    recall = np.linspace(0, 1, 1001)  # finer than GRID: the zoom covers a fifth of it
+    kinds = (("float", "float"), ("INT8", "quant"))
     for group, models in groups("classification").items():
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), sharey=True)
-        for ax, (kind, key) in zip(axes, (("float", "float"), ("INT8", "quant"))):
+        curves = {}
+        for kind, key in kinds:
             for m in models:
-                y, z = [], []
                 for d in run_dirs("classification", m):
                     s = np.load(d / ("scores.npz" if (d / "scores.npz").exists() else "results.npz"))
                     if f"y_score_{key}_test" in s:
-                        y.append(s["y_true_test"].ravel())
-                        z.append(s[f"y_score_{key}_test"].ravel())
-                if y:
-                    p, r, _ = precision_recall_curve(np.concatenate(y), np.concatenate(z))
-                    ax.plot(r, p, label=f"{m} ({len(y)} runs)")
-            ax.set(title=f"classification, test, {kind}", xlabel="recall", ylabel="precision", xlim=(0, 1), ylim=(0, 1.01))
-            ax.grid(alpha=0.3)
-            ax.legend(fontsize=7, loc="lower left")
-        fig.tight_layout()
-        fig.savefig(FIGURES / f"classification_pr_{group}.png", dpi=120)
-        plt.close(fig)
+                        p, r, _ = precision_recall_curve(s["y_true_test"].ravel(), s[f"y_score_{key}_test"].ravel())
+                        curves.setdefault((kind, m), []).append(np.interp(recall, r[::-1], p[::-1]))  # recall increasing
+        for kind, _ in kinds:
+            shown = [m for m in models if (kind, m) in curves]
+            if not shown:  # the non-causal ViTs have no INT8 export
+                continue
+            for suffix, lim in (("", (0, 1.01)), ("_zoom", ZOOM)):
+                fig, ax = plt.subplots(figsize=(6.5, 5.5))
+                for m in shown:
+                    mean_ci(ax, recall, curves[kind, m], f"{m} ({len(curves[kind, m])} runs)")
+                ax.set(title=f"classification, test, {kind}", xlabel="recall", ylabel="precision", xlim=lim[:1] + (1,), ylim=lim)
+                ax.grid(alpha=0.3)
+                ax.legend(fontsize=7, loc="lower left")
+                fig.tight_layout()
+                fig.savefig(FIGURES / f"classification_pr_{group}_{kind.lower()}{suffix}.png", dpi=120)
+                plt.close(fig)
 
 
 def detection():
-    grid = np.linspace(0, 1, 201)
     for experiment in ("detection_stream", "detection_window"):
         kind = "int8" if experiment == "detection_stream" else "float"
         for group, models in groups(experiment).items():
@@ -74,10 +99,10 @@ def detection():
                     curves = [c for c in curves if f"{split}/{kind}/roc_fpr" in c]
                     if not curves:
                         continue
-                    tpr = np.mean([np.interp(grid, c[f"{split}/{kind}/roc_fpr"], c[f"{split}/{kind}/roc_tpr"]) for c in curves], axis=0)
-                    boxes = np.mean([np.interp(grid, c[f"{split}/{kind}/time_recorded"], c[f"{split}/{kind}/boxes_captured"]) for c in curves], axis=0)
-                    axes[0, col].plot(100 * grid, 100 * tpr, label=f"{m} ({len(curves)} runs)")
-                    axes[1, col].plot(100 * grid, 100 * boxes, label=m)
+                    tpr = [100 * np.interp(GRID, c[f"{split}/{kind}/roc_fpr"], c[f"{split}/{kind}/roc_tpr"]) for c in curves]
+                    boxes = [100 * np.interp(GRID, c[f"{split}/{kind}/time_recorded"], c[f"{split}/{kind}/boxes_captured"]) for c in curves]
+                    mean_ci(axes[0, col], 100 * GRID, tpr, f"{m} ({len(curves)} runs)")
+                    mean_ci(axes[1, col], 100 * GRID, boxes, m)
                 axes[0, col].set(title=f"{split}: segment ROC ({kind})", xlabel="bird-free segments flagged (%)", ylabel="segments with a box flagged (%)")
                 axes[1, col].set(title=f"{split}: triggered recording ({kind})", xlabel="time recorded (%)", ylabel="annotation boxes captured (%)")
                 for ax in axes[:, col]:
@@ -128,7 +153,10 @@ def main():
     parser.add_argument("recording", nargs="?")
     parser.add_argument("--start", type=float)
     parser.add_argument("--end", type=float)
+    parser.add_argument("--ci", action="store_true", help="the 95 %% confidence bands of the mean curves")
     args = parser.parse_args()
+    global CI
+    CI = args.ci
     FIGURES.mkdir(parents=True, exist_ok=True)
     if args.what == "labels":
         return labels(args.recording, args.start, args.end)
