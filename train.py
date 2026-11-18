@@ -477,9 +477,24 @@ class Detector:
         return None
 
 
-def tflite_logits(path: Path, x: np.ndarray, threads: int = 16) -> np.ndarray:
-    """Logits of an INT8 TFLite model (batch of 1 baked in): one interpreter per thread."""
+def available_cpus() -> int:
+    """The CPUs this process may use: its affinity (SLURM's cpuset), capped by a cgroup CPU quota
+    (containers), shared between the runs in parallel (os.cpu_count() counts the whole node)."""
+    n = len(os.sched_getaffinity(0))
+    for quota, period in (("/sys/fs/cgroup/cpu.max", None), ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us")):
+        try:
+            q, t = Path(quota).read_text().split()[:2] if period is None else (Path(quota).read_text(), Path(period).read_text())
+            if q.strip() not in ("max", "-1"):
+                n = min(n, max(1, int(q) // int(t)))
+        except (OSError, ValueError):
+            pass
+    return max(1, n // int(os.environ.get("TSC_PARALLEL", "1")))
+
+
+def tflite_logits(path: Path, x: np.ndarray, threads: int | None = None) -> np.ndarray:
+    """Logits of an INT8 TFLite model (batch of 1 baked in): one single-threaded interpreter per thread."""
     import tensorflow as tf
+    threads = threads or min(16, available_cpus())
 
     def run(chunk):
         it = tf.lite.Interpreter(model_path=str(path), num_threads=1)
@@ -677,6 +692,7 @@ def main():
     jobs = [j for j in jobs if not (run_dir(*j) / "train.json").exists()]
     # every run in its own process (GPU memory, TensorFlow state); faulthandler: a crash in C prints its Python stack
     command = lambda j: [sys.executable, "-X", "faulthandler", __file__, "--one", j[0], j[1], str(j[2])]  # noqa: E731
+    os.environ["TSC_PARALLEL"] = str(args.parallel)   # the runs share the job's CPUs (available_cpus)
     with ThreadPoolExecutor(args.parallel) as pool:
         codes = list(pool.map(lambda j: subprocess.run(command(j)).returncode, jobs))
     failed = [(j, c) for j, c in zip(jobs, codes) if c]

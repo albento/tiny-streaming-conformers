@@ -108,6 +108,21 @@ def quiet_export() -> None:
         keras.Model.export = quiet
 
 
+def single_thread_tflite() -> None:
+    """PolyChirp scores the INT8 TFLite model clip by clip with os.cpu_count() - 4 threads per run:
+    the node's cores, not the job's (a container or SLURM job often gets a few of them), so runs in
+    parallel oversubscribe the CPU by 10-100x and a tiny model spends its time synchronizing threads.
+    One thread per interpreter: the fastest for a clip-sized model, and what the device does."""
+    from building.polychirp_training import results
+    if not getattr(results.make_tflite_runner, "single_thread", False):
+        make = results.make_tflite_runner
+
+        def runner(tflite_path, num_threads=1):
+            return make(tflite_path, 1)
+        runner.single_thread = True
+        results.make_tflite_runner = runner
+
+
 def train_classification(name: str, seed: int, run_dir: Path, protocol: dict, log) -> None:
     """One run of PolyChirp's scale benchmark (k = 10, one cell): PolyChirp trains, tunes the per-class
     thresholds, quantizes to INT8 TFLite and writes results.npz (every clip's float and INT8 scores on
@@ -116,6 +131,7 @@ def train_classification(name: str, seed: int, run_dir: Path, protocol: dict, lo
     from building.polychirp_training import runner
     install_protocol(runner, log)
     quiet_export()
+    single_thread_tflite()
     runner.scale_run_dir = lambda *args: run_dir
     keras.utils.set_random_seed(seed)
     config = runner.ScaleGridConfig(collection=COLLECTION, specs=[specs()[name]], epochs=protocol["epochs"],
