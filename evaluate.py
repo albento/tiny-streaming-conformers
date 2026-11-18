@@ -2,6 +2,10 @@
 the embedded cost of every model.
 
     uv run evaluate.py          # -> results/classification_runs.csv, results/detection_runs.csv, results/costs.csv
+    uv run evaluate.py --redo   # evaluate again the runs already in the CSV
+
+Incremental: the rows already in the CSV are kept (runs evaluated on another machine, or whose folder
+is gone); only the finished runs not in it yet are evaluated and added.
 
 Classification (PolyChirp's evaluation, the same for every model): per-class thresholds maximizing F2
 on the tuning set (train + val), then on the test clips: macro F2, macro average precision, and the
@@ -225,39 +229,57 @@ def baseline_costs(model: str, run: Path) -> dict:
     return out
 
 
+KEYS = ["experiment", "model", "seed"]
+
+
+def merge(path: Path, new: list[dict], keys: list[str], replaced: set) -> None:
+    """Writes path: its existing rows, minus those of the replaced keys, plus the new rows."""
+    import pandas as pd
+    old = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=keys)
+    old = old[[tuple(k) not in replaced for k in old[keys].itertuples(index=False)]]
+    out = pd.concat([old, pd.DataFrame(new)], ignore_index=True) if new else old
+    if len(out):
+        out.sort_values(keys, kind="stable").to_csv(path, index=False)
+
+
 def main():
+    import argparse
+    import pandas as pd
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--redo", action="store_true", help="evaluate again the runs already in the CSV (their rows replaced)")
+    args = parser.parse_args()
     import tensorflow as tf
     tf.config.set_visible_devices([], "GPU")   # nothing here needs a GPU
     RESULTS.mkdir(exist_ok=True)
     splits = json.loads((DATA / "splits.json").read_text()) if (DATA / "splits.json").exists() else None
     tests = {"ssw_test": [("ssw", f) for f in splits["ssw"]["test"]], "sne_test": [("sne", f) for f in splits["sne"]["test"]]} if splits else {}
-    box = {c: boxes(c) for c in ("ssw", "sne")} if splits else {}
-    rows = {"classification": [], "detection": []}
-    for run in sorted(RUNS.glob("*/*/seed_*")):
-        if run.name.endswith(".partial") or not (run / "train.json").exists():
-            continue
-        experiment, model, seed = run.parts[-3], run.parts[-2], int(run.name.split("_")[1])
-        found = classification_rows(run) if experiment == "classification" else detection_rows(run, tests, box)
-        target = "classification" if experiment == "classification" else "detection"
-        rows[target] += [{"experiment": experiment, "model": model, "seed": seed, **r} for r in found]
-        print(f"{run}: {len(found)} rows", flush=True)
-    for name, r in rows.items():
-        if r:
-            with open(RESULTS / f"{name}_runs.csv", "w", newline="") as fh:
-                w = csv.DictWriter(fh, fieldnames=list(r[0]))
-                w.writeheader()
-                w.writerows(r)
+    box = None
+    for name in ("classification", "detection"):
+        path = RESULTS / f"{name}_runs.csv"
+        done = set(pd.read_csv(path)[KEYS].itertuples(index=False, name=None)) if path.exists() else set()
+        rows, replaced = [], set()
+        for run in sorted(RUNS.glob("*/*/seed_*")):
+            experiment, model = run.parts[-3], run.parts[-2]
+            if run.name.endswith(".partial") or not (run / "train.json").exists() or (experiment == "classification") != (name == "classification"):
+                continue
+            key = (experiment, model, int(run.name.split("_")[1]))
+            if key in done and not args.redo and (name == "classification" or (run / "curves.npz").exists()):
+                continue   # already in the CSV (detection: and its curves for plot.py)
+            if name == "detection" and box is None:
+                box = {c: boxes(c) for c in ("ssw", "sne")}
+            found = classification_rows(run) if name == "classification" else detection_rows(run, tests, box)
+            rows += [dict(zip(KEYS, key)) | r for r in found]
+            replaced.add(key)
+            print(f"{run}: {len(found)} rows", flush=True)
+        merge(path, rows, KEYS, replaced)
+        print(f"{path.name}: {len(replaced)} runs evaluated, the others kept")
+    path = RESULTS / "costs.csv"
+    known = set(pd.read_csv(path)["model"]) if path.exists() else set()
     costs = []
-    for model in sorted({run.parts[-2] for run in RUNS.glob("*/*/seed_*")}):
+    for model in sorted({run.parts[-2] for run in RUNS.glob("*/*/seed_*")} - (set() if args.redo else known)):
         run = next(iter(sorted(RUNS.glob(f"*/{model}/seed_*"))))
         costs.append({"model": model, **(vit_costs(model, run) if re.match(r"vit_", model) else baseline_costs(model, run))})
-    if costs:
-        keys = list(dict.fromkeys(k for c in costs for k in c))
-        with open(RESULTS / "costs.csv", "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=keys)
-            w.writeheader()
-            w.writerows(costs)
-
+    merge(path, costs, ["model"], {(c["model"],) for c in costs})
 
 if __name__ == "__main__":
     main()

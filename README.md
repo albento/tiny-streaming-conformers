@@ -203,6 +203,11 @@ uv run aggregate.py     # results/classification_summary.csv, detection_summary.
 uv run plot.py          # results/figures/
 ```
 
+`evaluate.py` is incremental: it adds the finished runs not in the CSV yet and keeps the rows already
+there, so runs evaluated on other machines can be gathered in one CSV (`--redo` evaluates again the
+runs present). The curves need each run's scores (`scores.npz` or `results.npz`, `curves.npz`) and
+`train.json`, not its weights.
+
 - Classification (test clips): macro F2 at per-class thresholds tuned on train + val (PolyChirp's
   evaluation), macro average precision, clip error (predicted set of species ≠ true set).
 - Detection (SSW test days, SNE), the first 8 s of every recording left out:
