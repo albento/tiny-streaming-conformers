@@ -44,6 +44,11 @@ import yaml
 from paths import DATA, ROOT, RUNS
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # TensorFlow's C++ logs (PolyChirp sets the same, later)
+# TensorFlow's GPU compiler (XLA) takes the first ptxas on the PATH: the venv's (CUDA 12.3, TensorFlow's own)
+# before a system CUDA's, which may not support the GPU (CUDA 13 dropped the V100: "ptxas does not support CC 7.0")
+_PTXAS = Path(np.__file__).resolve().parents[1] / "nvidia" / "cuda_nvcc" / "bin"
+if _PTXAS.is_dir():
+    os.environ["PATH"] = f"{_PTXAS}{os.pathsep}{os.environ.get('PATH', '')}"
 
 CONFIG = yaml.safe_load((ROOT / "models.yaml").read_text())
 P = CONFIG["protocol"]
@@ -670,11 +675,24 @@ def main():
             print(f"{e:18s} {m:18s} seed {s}  {'done' if (run_dir(e, m, s) / 'train.json').exists() else '-'}")
         return
     jobs = [j for j in jobs if not (run_dir(*j) / "train.json").exists()]
-    command = lambda j: [sys.executable, __file__, "--one", j[0], j[1], str(j[2])]  # noqa: E731
-    with ThreadPoolExecutor(args.parallel) as pool:  # every run in its own process (GPU memory, TensorFlow state)
+    # every run in its own process (GPU memory, TensorFlow state); faulthandler: a crash in C prints its Python stack
+    command = lambda j: [sys.executable, "-X", "faulthandler", __file__, "--one", j[0], j[1], str(j[2])]  # noqa: E731
+    with ThreadPoolExecutor(args.parallel) as pool:
         codes = list(pool.map(lambda j: subprocess.run(command(j)).returncode, jobs))
-    failed = [j for j, c in zip(jobs, codes) if c]
-    print(f"{len(jobs) - len(failed)} runs done" + (f", failed: {failed}" if failed else ""))
+    failed = [(j, c) for j, c in zip(jobs, codes) if c]
+    print(f"{len(jobs) - len(failed)} runs done" + (f", {len(failed)} failed:" if failed else ""))
+    for (e, m, seed), c in failed:
+        print(f"  {e} {m} seed {seed}: " + (f"exit code {c} (its traceback is above)" if c > 0 else exit_signal(-c)))
+
+
+def exit_signal(number: int) -> str:
+    """Why a run was killed: no Python traceback is printed in that case."""
+    import signal
+    name = signal.Signals(number).name if number in signal.Signals._value2member_map_ else f"signal {number}"
+    hint = {"SIGKILL": "killed from outside: usually out of memory (a SLURM job's memory limit, or the kernel's OOM killer)",
+            "SIGSEGV": "crash in C code (see the faulthandler stack above)", "SIGABRT": "abort in C code (see above)",
+            "SIGTERM": "terminated (time limit of the job?)"}.get(name, "")
+    return f"killed by {name}" + (f": {hint}" if hint else "")
 
 
 if __name__ == "__main__":
