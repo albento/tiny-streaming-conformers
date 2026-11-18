@@ -76,14 +76,17 @@ def make_vit(model: str, n_classes: int):
     return vit.ViT(n_classes, CONFIG["vit"]["stems"][stem], int(layers), causal=not nc, **CONFIG["vit"]["architecture"])
 
 
-def seed_everything(seed: int) -> None:
+def seed_everything(seed: int, vit: bool) -> None:
+    """Python, NumPy, TensorFlow; PyTorch for the ViT only: a PolyChirp run never imports PyTorch,
+    whose CUDA 13 runtime, once in the process, breaks TensorFlow's CUDA 12 kernels ("invalid device function")."""
     import random
     import keras
-    import torch
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
     keras.utils.set_random_seed(seed)
+    if vit:
+        import torch
+        torch.manual_seed(seed)
 
 
 RUN = ""  # "[experiment model s<seed>]", set by run_one: every line of a run starts with it (runs in parallel interleave)
@@ -605,10 +608,15 @@ class Tee:
 
 def tensorflow_gpu_ok() -> bool:
     """False on GPUs newer than PolyChirp's TensorFlow 2.16 (compiled up to compute capability 9.0):
-    Blackwell (12.x) fails at the first kernel."""
-    import torch
-    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 10:
-        say(f"{torch.cuda.get_device_name(0)}: TensorFlow 2.16 cannot run on this GPU, PolyChirp's models train on the CPU")
+    Blackwell (12.x) fails at the first kernel. Asked to TensorFlow, before it uses the GPU (not to
+    PyTorch: see seed_everything)."""
+    import tensorflow as tf
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        return True
+    details = tf.config.experimental.get_device_details(gpus[0])
+    if details.get("compute_capability", (0, 0))[0] >= 10:
+        say(f"{details.get('device_name', 'GPU')}: TensorFlow 2.16 cannot run on this GPU, PolyChirp's models train on the CPU")
         return False
     return True
 
@@ -630,7 +638,7 @@ def run_one(experiment: str, model: str, seed: int) -> None:
         # TensorFlow 2.16 has no kernels for (Blackwell, compute capability 12): on the CPU, slower.
         import tensorflow as tf
         tf.config.set_visible_devices([], "GPU")
-    seed_everything(seed)
+    seed_everything(seed, model.startswith("vit_"))
     t0 = time.time()
     (train_classification(model, seed, tmp) if experiment == "classification" else train_detection(experiment, model, seed, tmp))
     tmp.rename(out)
