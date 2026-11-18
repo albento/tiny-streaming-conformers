@@ -10,7 +10,7 @@ bird species classification and on bird / no-bird detection in long recordings.
 | File | What it does |
 |---|---|
 | `models.yaml` | every model, experiment and the training protocol |
-| `.env`, `paths.py` | where the data and runs go (default: inside the repository) |
+| `.env`, `paths.py`, `env.sh` | where the data, runs and virtualenv go (default: inside the repository); `source env.sh` passes uv's folders to uv |
 | `vit.py` | our ViT (PyTorch), nothing else |
 | `baselines.py` | PolyChirp's models (Mel-PolyChirp ×2 / ×3, WrenNet) and our changes to PolyChirp |
 | `prepare_classification.py` | builds PolyChirp's Paris dataset |
@@ -31,6 +31,7 @@ versioned; `.env` can move them out of the repository ([Where the data go](#wher
 ```sh
 git clone --recursive git@github.com:albento/tiny-streaming-conformers.git
 cd tiny-streaming-conformers
+source env.sh                    # only if .env moves uv's folders (Where the data go)
 uv sync                          # .venv: Python 3.12, PyTorch, TensorFlow 2.16, PolyChirp
 source .venv/bin/activate        # or prefix every command with `uv run`
 ```
@@ -56,13 +57,25 @@ POLYCHIRP_DATA_DIR=/scratch/me/tsc/polychirp # classification data and its cache
 PolyChirp's code only reads its own folders, so `polychirp/raw_dataset/`,
 `polychirp/datasets/scale_49_2_r50/` and its decoded-audio cache (`polychirp/.cache/dataset_cache/`)
 become links to `POLYCHIRP_DATA_DIR`. Give each variable a
-folder of its own: `train.py --clean` deletes the runs in `RUNS_DIR`. uv's own large folders are set
-in the shell, before `uv sync`:
+folder of its own: `train.py --clean` deletes the runs in `RUNS_DIR`.
+
+uv's own large folders are in `.env` too, but uv reads them from the environment only: `source env.sh`
+exports the variables of `.env` that are set, in each new shell and job script, before calling uv.
 
 ```sh
-export UV_CACHE_DIR=/scratch/me/uv-cache            # uv's download cache (default ~/.cache/uv)
-export UV_PROJECT_ENVIRONMENT=/scratch/me/tsc/venv  # the virtualenv, ~12 GB (default .venv/); activate it there
+UV_PROJECT_ENVIRONMENT=/scratch/me/tsc/venv  # the virtualenv, ~12 GB (default .venv/)
+UV_CACHE_DIR=/scratch/me/uv-cache            # uv's download cache, ~12 GB (default ~/.cache/uv)
+UV_PYTHON_INSTALL_DIR=/scratch/me/uv-python  # the Pythons uv installs (default ~/.local/share/uv/python)
 ```
+
+```sh
+source env.sh                    # then, as usual:
+uv sync                          # into UV_PROJECT_ENVIRONMENT
+uv run train.py ...              # or source $UV_PROJECT_ENVIRONMENT/bin/activate
+```
+
+Keep the cache on the virtualenv's file system: uv then hard-links the packages instead of copying
+them. Moving an existing virtualenv breaks it: delete it and run `uv sync` again.
 
 ## Data
 
