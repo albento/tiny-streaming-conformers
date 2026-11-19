@@ -11,7 +11,7 @@ recorder. Every curve is the mean over the runs (each run's curve on a common gr
 confidence interval as a band (Student's t, n - 1 degrees of freedom; none with one run): a check of the
 runs' spread, not a comparison of models, whose runs share their seeds (aggregate.py's *_paired.csv
 compares them seed by seed). The models are grouped as the comparisons of the paper:
-the causal ViTs with PolyChirp's models, and the non-causal ViTs with PolyChirp's models (the same
+the causal ViTs with the baselines, and the non-causal ViTs with the baselines (the same
 regime: 3 s windows); for detection_stream, the causal ViTs alone (the device's regime).
 """
 import argparse

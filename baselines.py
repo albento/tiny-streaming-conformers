@@ -1,15 +1,19 @@
-"""PolyChirp's models, as PolyChirp builds and trains them, and our changes to PolyChirp, applied at
-run time (the submodule is never modified):
+"""The baselines: PolyChirp's models, as PolyChirp builds and trains them, and WrenNet, as its
+authors implemented it.
 
+Mel-PolyChirp x2 / x3: PolyChirp's mel_ultralight, on its MEL_ULTRALIGHT front end, with our changes
+to PolyChirp, applied at run time (the submodule is never modified):
 - the training protocol: PolyChirp's runner keeps the weights of the epoch with the best validation
   loss and stops on it; here, as for every model of the paper, on the best validation macro average
   precision (min_delta 1e-4, at most 100 epochs, patience 10; the learning-rate plateau follows it);
 - the run folders: under runs/ instead of the submodule's models/.
 
-Mel-PolyChirp x2 / x3 (PolyChirp's mel_ultralight, on its MEL_ULTRALIGHT front end) and WrenNet
-(PolyChirp's port, on MEL_HIGHER): each on the front end PolyChirp's code assigns it.
+WrenNet: its authors' PyTorch code (submodule wrennet/, unmodified), trained by train.py like the ViT
+(PolyChirp's port of it, without the GRU, falls 0.006 macro F2 short of it).
 """
 import inspect
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -22,10 +26,9 @@ K = 10                         # the 10 target species; non_target is the all-ze
 
 
 def specs() -> dict:
-    from building.models import TinyChirpModel, mel_cnn_new, wrennet
+    from building.models import TinyChirpModel, mel_cnn_new
     return {"mel_polychirp_x2": TinyChirpModel(base_model=mel_cnn_new.ULTRALIGHT, multi=2.0),
-            "mel_polychirp_x3": TinyChirpModel(base_model=mel_cnn_new.ULTRALIGHT, multi=3.0),
-            "wrennet": TinyChirpModel(base_model=wrennet.MODEL)}
+            "mel_polychirp_x3": TinyChirpModel(base_model=mel_cnn_new.ULTRALIGHT, multi=3.0)}
 
 
 def species(catalog, seed: int) -> tuple[list[int], int]:
@@ -148,3 +151,77 @@ def build_detector(name: str):
     spec = specs()[name]
     quiet_export()
     return spec.builder(1), lambda audio: featurize(audio, spec.input_frontend)
+
+
+# --- WrenNet: its authors' code (submodule wrennet/), in PyTorch ---------------------------------------
+
+# Improved_Phi_GRU_ATT as config/experiments/four_birds_combined.yaml sets it (the authors' final
+# version, 53,581 parameters at 10 classes): a semi-learnable log-linear filter bank (64 filters, the
+# breakpoint and transition width learned) on a 32 kHz STFT, AmplitudeToDB (top_db 80) and per-clip
+# standardization, MatchboxNetSkip (its defaults hold: the config's num_layers / kernel_size / dropout
+# are not the keys it reads), a GRU, attention pooling. f_min / f_max: what the authors' training script
+# passed (the dataset's lowcut / highcut; the refactored code's f_min = 0 makes the log scale NaN).
+WRENNET = dict(spectrogram_type="combined_log_linear", sample_rate=32000, n_mel_bins=64, n_linear_filters=64, hidden_dim=64,
+               n_fft=1024, hop_length=320, f_min=150.0, f_max=10000.0, breakpoint=4000, transition_width=100,
+               matchbox=dict(base_filters=32, num_layers=3, kernel_size=5, stride=1, dropout=0.05))
+WRENNET_LR = {"breakpoint": 3.0, "transition_width": 0.1}  # the config's own learning rates of the two front-end parameters
+
+
+def wrennet_imports() -> None:
+    """What WrenNet's code imports beyond PyTorch: torchaudio (for AmplitudeToDB only, rewritten here:
+    torchaudio's last release, 2.11, built for CUDA 13.0, does not load with this PyTorch), omegaconf
+    (a type hint) and torchsummary (unused); then the submodule, after the repository (both have a train.py)."""
+    import torch
+
+    class AmplitudeToDB(torch.nn.Module):
+        """torchaudio 2.11's transforms.AmplitudeToDB (amin 1e-10, ref 1), its quirk included: a 3-D input
+        [batch, freq, time] gets one top_db cut-off for the whole batch."""
+
+        def __init__(self, stype: str = "power", top_db: float | None = None):
+            super().__init__()
+            self.multiplier, self.top_db = 10.0 if stype == "power" else 20.0, top_db
+
+        def forward(self, x):
+            x_db = self.multiplier * torch.log10(torch.clamp(x, min=1e-10))
+            if self.top_db is not None:
+                shape = x_db.size()
+                x_db = x_db.reshape(-1, shape[-3] if x_db.dim() > 2 else 1, shape[-2], shape[-1])
+                x_db = torch.max(x_db, (x_db.amax(dim=(-3, -2, -1)) - self.top_db).view(-1, 1, 1, 1)).reshape(shape)
+            return x_db
+    modules = {name: types.ModuleType(name) for name in ("torchaudio", "torchaudio.functional", "torchaudio.transforms", "omegaconf", "torchsummary")}
+    modules["torchaudio"].functional, modules["torchaudio"].transforms = modules["torchaudio.functional"], modules["torchaudio.transforms"]
+    modules["torchaudio.transforms"].AmplitudeToDB = AmplitudeToDB
+    modules["omegaconf"].DictConfig = dict
+    modules["torchsummary"].summary = None
+    for name, module in modules.items():
+        sys.modules.setdefault(name, module)
+    if str(paths.ROOT / "wrennet") not in sys.path:
+        sys.path.append(str(paths.ROOT / "wrennet"))
+
+
+def wrennet(n_outputs: int):
+    """WrenNet (PyTorch), one logit per output, with a fix: its front end caches its filter bank while the
+    breakpoint and transition width are unchanged, and the bank cached during validation (no gradient)
+    is then reused in training, freezing both after the first epoch: the cache is cleared before every
+    forward pass that needs gradients."""
+    import torch
+    wrennet_imports()
+    from birds_distillation_edge.models.legacy_models import Improved_Phi_GRU_ATT
+    model = Improved_Phi_GRU_ATT(num_classes=n_outputs, **WRENNET)
+    model.combined_log_linear_spec.register_forward_pre_hook(lambda spec, args: spec.rebuild_filters() if torch.is_grad_enabled() else None)
+    return model
+
+
+def wrennet_parameters(model, lr: float) -> list[dict]:
+    """The optimizer's parameter groups: the front end's breakpoint and transition width at their own rates."""
+    spec = model.combined_log_linear_spec
+    own = {"breakpoint": spec.breakpoint, "transition_width": spec.transition_width}
+    rest = [p for p in model.parameters() if all(p is not q for q in own.values())]
+    return [{"params": rest, "lr": lr}] + [{"params": [p], "lr": WRENNET_LR[name]} for name, p in own.items()]
+
+
+def wrennet_input(audio) -> np.ndarray:
+    """Audio [n, samples] in [-1, 1] at 16 kHz (PolyChirp's clips, the soundscapes) -> 32 kHz, WrenNet's
+    rate: our data hold nothing above 8 kHz (PolyChirp kept 16 kHz clips only), WrenNet sees what every model sees."""
+    from scipy.signal import resample_poly
+    return resample_poly(np.asarray(audio, np.float32).reshape(len(audio), -1), 2, 1, axis=1).astype(np.float32)

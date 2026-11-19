@@ -16,3 +16,6 @@
 [submodule "firmware/AudioMoth-Project"]
 	path = firmware/AudioMoth-Project
 	url = https://github.com/OpenAcousticDevices/AudioMoth-Project.git
+[submodule "wrennet"]
+	path = wrennet
+	url = https://github.com/wren-framework/wrennet.git

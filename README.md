@@ -2,8 +2,8 @@
 
 Code and results of the paper "Tiny streaming Conformers for real-time bird sound detection on
 low-resource acoustic recorders" (submitted to ESANN 2027): a streaming Conformer-like ViT that decides
-every 64 ms on the AudioMoth (Cortex-M4F, 48 MHz, 32 KB RAM), compared with PolyChirp's models on
-bird species classification and on bird / no-bird detection in long recordings.
+every 64 ms on the AudioMoth (Cortex-M4F, 48 MHz, 32 KB RAM), compared with PolyChirp's models and
+WrenNet on bird species classification and on bird / no-bird detection in long recordings.
 
 ## Contents
 
@@ -12,7 +12,7 @@ bird species classification and on bird / no-bird detection in long recordings.
 | `models.yaml` | every model, experiment and the training protocol |
 | `.env`, `paths.py`, `env.sh` | where the data, runs and virtualenv go (default: inside the repository); `source env.sh` passes uv's folders to uv |
 | `vit.py` | our ViT (PyTorch), nothing else |
-| `baselines.py` | PolyChirp's models (Mel-PolyChirp ×2 / ×3, WrenNet) and our changes to PolyChirp |
+| `baselines.py` | the baselines: PolyChirp's Mel-PolyChirp ×2 / ×3 (and our changes to PolyChirp), WrenNet's original code |
 | `prepare_classification.py` | builds PolyChirp's Paris dataset |
 | `prepare_detection.py` | downloads and labels the SSW / SNE soundscapes |
 | `train.py` | trains any model of any experiment |
@@ -22,6 +22,7 @@ bird species classification and on bird / no-bird detection in long recordings.
 | `export.py` | INT8 export of the ViT to C, host inference, AudioMoth firmware |
 | `firmware/` | the ViT and front end in C; AudioMoth, CMSIS as submodules |
 | `polychirp/` | PolyChirp (submodule, never modified) |
+| `wrennet/` | WrenNet, its authors' code (submodule, never modified) |
 
 `results/` holds the CSV and figures of the paper. `runs/` (weights, scores) and `data/` are not
 versioned; `.env` can move them out of the repository ([Where the data go](#where-the-data-go)).
@@ -136,8 +137,12 @@ encoder layer with ALiBi attention (dim 32, 4 heads, FFN 128).
 | layers | 1, 2, 3 |
 | `_nc` | non-causal (float reference); default causal: streams on the AudioMoth, attention on the last 32 tokens |
 
-PolyChirp's models, each on the front end PolyChirp's code assigns it: `mel_polychirp_x2`,
-`mel_polychirp_x3`, `wrennet`.
+The baselines: PolyChirp's `mel_polychirp_x2` and `mel_polychirp_x3`, on the front end PolyChirp's code
+assigns them, and `wrennet`, its authors' PyTorch code (submodule `wrennet/`: their final configuration,
+learned log-linear front end at 32 kHz, GRU, 53.6k parameters), trained by `train.py` like the ViT, on
+our 16 kHz data upsampled to 32 kHz; float only. Its front end's filter-bank cache froze the learned
+front end after the first epoch: fixed in `baselines.wrennet`. PolyChirp's port of WrenNet (no GRU,
+its own mel front end), used before, scored 0.006 macro F2 below it.
 
 | Experiment | Task | Models |
 |---|---|---|
@@ -235,8 +240,8 @@ runs present). The curves need each run's scores (`scores.npz` or `results.npz`,
     pre-roll and ends 1.5 s after the last detection): time recorded vs annotation boxes captured,
     summarized as the time needed for 80 / 90 % of the boxes and the boxes captured with 20 / 30 % of
     the time.
-- Float and INT8 for every model: the ViT's INT8 is its firmware C run on the host (`firmware/host_infer.c`),
-  PolyChirp's models' their INT8 TFLite model.
+- Float and INT8 for every model but WrenNet (float only): the ViT's INT8 is its firmware C run on the
+  host (`firmware/host_infer.c`), PolyChirp's models' their INT8 TFLite model.
 - Costs: parameters, multiply-accumulates per second of audio (front end included), flash, RAM.
 - Summaries: mean over runs ± standard error (standard deviation / √runs).
 

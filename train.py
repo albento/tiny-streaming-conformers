@@ -17,7 +17,8 @@ Experiments (models.yaml):
   (clips, augmentation, class weights, threshold tuning set) for every model. The ViT reads its
   46 buffers (2.94 s) and decides as the device: an exponential moving average (0.5 s) of its buffer
   logits, max over the clip (a smooth max in training). Scores: every clip of the tuning set (train
-  + val, clean) and of the test set, float and INT8 (the firmware C on the host, or PolyChirp's TFLite).
+  + val, clean) and of the test set, float and INT8 (the firmware C on the host, or PolyChirp's TFLite;
+  WrenNet, its authors' PyTorch code, trained as the ViT: float only).
 - detection_stream: bird / no bird for every 64 ms buffer of the soundscapes (prepare_detection.py),
   causal ViTs streamed over each one-hour recording as on the device (INT8) and by overlapping windows
   (float). Training: random 30 s regions (9 h of audio per epoch), the loss on every buffer after the
@@ -81,15 +82,20 @@ def make_vit(model: str, n_classes: int):
     return vit.ViT(n_classes, CONFIG["vit"]["stems"][stem], int(layers), causal=not nc, **CONFIG["vit"]["architecture"])
 
 
-def seed_everything(seed: int, vit: bool) -> None:
-    """Python, NumPy, TensorFlow; PyTorch for the ViT only: a PolyChirp run never imports PyTorch,
+def uses_torch(model: str) -> bool:
+    """The PyTorch models: the ViT and WrenNet; the others are PolyChirp's (Keras)."""
+    return model.startswith("vit_") or model == "wrennet"
+
+
+def seed_everything(seed: int, torch_model: bool) -> None:
+    """Python, NumPy, TensorFlow; PyTorch for its models only: a PolyChirp run never imports PyTorch,
     whose CUDA 13 runtime, once in the process, breaks TensorFlow's CUDA 12 kernels ("invalid device function")."""
     import random
     import keras
     random.seed(seed)
     np.random.seed(seed)
     keras.utils.set_random_seed(seed)
-    if vit:
+    if torch_model:
         import torch
         torch.manual_seed(seed)
 
@@ -192,10 +198,75 @@ def vit_input(audio) -> np.ndarray:
     return np.asarray(audio, np.float32).reshape(len(audio), -1)[:, :CLIP_SAMPLES] * 32768
 
 
-def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
+def fit(model, opt, train_ds, val_ds, inputs, clip_logits, dev) -> Protocol:
+    """The protocol on a PyTorch classifier: PolyChirp's weighted loss (binary cross-entropy, sample
+    weights, summed over the clips) of clip_logits(x, train=True), x = inputs(audio); selection on the
+    validation macro AP; the best weights loaded at the end."""
     import torch
     import torch.nn.functional as F
     from sklearn.metrics import average_precision_score
+    protocol, best = Protocol(), {}
+
+    def loss_sum(z, y, w):
+        return (w * F.binary_cross_entropy_with_logits(z, y, reduction="none").mean(1)).sum()
+
+    def tensors(audio, y, w):
+        return (torch.from_numpy(a).to(dev) for a in (inputs(audio), np.array(y, np.float32), np.array(w, np.float32)))
+    for epoch in range(P["epochs"]):
+        model.train()
+        total, n = torch.zeros((), device=dev), 0
+        for batch in train_ds:
+            x, y, w = tensors(*batch)
+            loss = loss_sum(clip_logits(x, True), y, w) / len(x)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            total, n = total + loss.detach() * len(x), n + len(x)
+        model.eval()
+        z, y, val_total, val_n = [], [], 0.0, 0
+        with torch.no_grad():
+            for batch in val_ds:
+                x, t, w = tensors(*batch)
+                logits = clip_logits(x, True)
+                z.append(logits.cpu().numpy())
+                y.append(np.asarray(batch[1]))
+                val_total, val_n = val_total + float(loss_sum(logits, t, w)), val_n + len(x)
+        if torch_step(model, protocol, opt, epoch, -average_precision_score(np.concatenate(y), np.concatenate(z), average="macro"), best,
+                      train_loss=float(total) / n, val_loss=val_total / val_n):
+            break
+    model.load_state_dict(best)
+    model.eval()
+    return protocol
+
+
+def write_scores(out: Path, t0: float, labels, tune_ds, val_ds, test_ds, inputs, probability, int8=None) -> None:
+    """scores.npz: every clip's labels and scores, probability(x) for x = inputs(audio) (and INT8: int8(x)
+    on x stacked by ~4096 clips), on the tuning set (train + val, clean) and the test set."""
+    def scores(datasets):
+        y, f, q, pending = [], [], [], []
+        for ds in datasets:
+            for audio, t, *_ in ds:   # the clean train split has no sample weights
+                x = inputs(audio)
+                f.append(probability(x))
+                y.append(np.asarray(t))
+                if int8 is not None:
+                    pending.append(x)
+                    if sum(map(len, pending)) >= 4096:
+                        q.append(int8(np.concatenate(pending)))
+                        pending = []
+        if int8 is not None and pending:
+            q.append(int8(np.concatenate(pending)))
+        return np.concatenate(y), np.concatenate(f), np.concatenate(q) if q else None
+    result = {"label_names": np.array(labels)}
+    for split, datasets in (("train", (tune_ds, val_ds)), ("test", (test_ds,))):
+        note(t0, f"scoring the {'tuning set (train + val)' if split == 'train' else 'test set'}, float" + (" and INT8" if int8 else ""))
+        y, f, q = scores(datasets)
+        result |= {f"y_true_{split}": y, f"y_score_float_{split}": f} | ({f"y_score_quant_{split}": q} if q is not None else {})
+    np.savez_compressed(out / "scores.npz", **result)
+
+
+def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
+    import torch
     import export
     import vit
     t0 = time.time()
@@ -214,39 +285,11 @@ def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
         m0 = torch.stack(powers).mean(0)
     logits = lambda x: model(x, m_init=m0.expand(len(x), -1))  # noqa: E731
     opt = torch.optim.Adam(model.parameters(), lr=P["lr"], eps=P["adam_eps"])
-    protocol, best = Protocol(), {}
-    def loss_sum(x, y, w):   # PolyChirp's weighted loss, summed over the clips (the readout of training)
-        return (w * F.binary_cross_entropy_with_logits(clip_logits(logits(x), True), y, reduction="none").mean(1)).sum()
-
-    def tensors(audio, y, w):
-        return (torch.from_numpy(a).to(dev) for a in (vit_input(audio), np.array(y, np.float32), np.array(w, np.float32)))
     note(t0, f"training on {torch_name(dev)}")
-    for epoch in range(P["epochs"]):
-        model.train()
-        total, n = torch.zeros((), device=dev), 0
-        for batch in train_ds:
-            x, y, w = tensors(*batch)
-            loss = loss_sum(x, y, w) / len(x)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            total, n = total + loss.detach() * len(x), n + len(x)
-        model.eval()
-        z, y, val_total, val_n = [], [], 0.0, 0
-        with torch.no_grad():
-            for batch in val_ds:
-                x, t, w = tensors(*batch)
-                z.append(clip_logits(logits(x), True).cpu().numpy())
-                y.append(np.asarray(batch[1]))
-                val_total, val_n = val_total + float(loss_sum(x, t, w)), val_n + len(x)
-        if torch_step(model, protocol, opt, epoch, -average_precision_score(np.concatenate(y), np.concatenate(z), average="macro"), best,
-                      train_loss=float(total) / n, val_loss=val_total / val_n):
-            break
-    model.load_state_dict(best)
-    model.eval()
+    protocol = fit(model, opt, train_ds, val_ds, vit_input, lambda x, train: clip_logits(logits(x), train), dev)
     out.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "m_init": m0.cpu()}, out / "model.pt")
-    binary = None
+    int8 = None
     if model.causal:  # INT8: calibration spectrograms from the first validation clips
         calib, n = [], 0
         for audio, *_ in val_ds:
@@ -261,38 +304,45 @@ def train_vit_classification(model_name: str, seed: int, out: Path) -> None:
         binary = export.build_host(out / "export")
         note(t0, "INT8 export done (export/)")
 
-    def scores(datasets):
-        y, fz, qz, pending = [], [], [], []
+        def int8(x):   # the firmware C on the host, buffer by buffer, then the same readout
+            zb = export.host_logits(binary, np.clip(np.round(x), -32768, 32767).astype(np.int16))
+            return torch.sigmoid(clip_logits(torch.from_numpy(zb), False)).numpy()
 
-        def int8(pending):  # the firmware C on the host, buffer by buffer, then the same readout
-            zb = export.host_logits(binary, np.clip(np.round(np.concatenate(pending)), -32768, 32767).astype(np.int16))
-            qz.append(torch.sigmoid(clip_logits(torch.from_numpy(zb), False)).numpy())
-        for ds in datasets:
-            for audio, t, *_ in ds:   # the clean train split has no sample weights
-                x = vit_input(audio)
-                with torch.no_grad():
-                    fz.append(torch.sigmoid(clip_logits(logits(torch.from_numpy(x).to(dev)), False)).cpu().numpy())
-                y.append(np.asarray(t))
-                if binary is not None:
-                    pending.append(x)
-                    if sum(map(len, pending)) >= 4096:
-                        int8(pending)
-                        pending = []
-        if binary is not None and pending:
-            int8(pending)
-        return np.concatenate(y), np.concatenate(fz), np.concatenate(qz) if qz else None
-    result = {"label_names": np.array(labels)}
-    for split, datasets in (("train", (tune_ds, val_ds)), ("test", (test_ds,))):
-        note(t0, f"scoring the {'tuning set (train + val)' if split == 'train' else 'test set'}, float" + (" and INT8" if binary else ""))
-        y, f, q = scores(datasets)
-        result |= {f"y_true_{split}": y, f"y_score_float_{split}": f} | ({f"y_score_quant_{split}": q} if q is not None else {})
-    np.savez_compressed(out / "scores.npz", **result)
+    def probability(x):
+        with torch.no_grad():
+            return torch.sigmoid(clip_logits(logits(torch.from_numpy(x).to(dev)), False)).cpu().numpy()
+    write_scores(out, t0, labels, tune_ds, val_ds, test_ds, vit_input, probability, int8)
     save_json(out / "train.json", protocol, t0, parameters=sum(p.numel() for p in model.parameters()))
+
+
+def train_wrennet_classification(seed: int, out: Path) -> None:
+    """WrenNet (baselines.py), trained as the ViT, float only (no INT8 version)."""
+    import torch
+    import baselines
+    t0 = time.time()
+    dev = torch_device()
+    train_ds, val_ds, test_ds, tune_ds, labels = classification_data(seed)
+    model = baselines.wrennet(len(labels)).to(dev)
+    opt = torch.optim.Adam(baselines.wrennet_parameters(model, P["lr"]), eps=P["adam_eps"])
+    note(t0, f"training on {torch_name(dev)}")
+    protocol = fit(model, opt, train_ds, val_ds, baselines.wrennet_input, lambda x, train: model(x), dev)
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": model.state_dict()}, out / "model.pt")
+
+    def probability(x):
+        with torch.no_grad():
+            return torch.sigmoid(model(torch.from_numpy(x).to(dev))).cpu().numpy()
+    write_scores(out, t0, labels, tune_ds, val_ds, test_ds, baselines.wrennet_input, probability)
+    spec = model.combined_log_linear_spec
+    save_json(out / "train.json", protocol, t0, parameters=sum(p.numel() for p in model.parameters()),
+              front_end={"breakpoint_hz": spec.breakpoint.item(), "transition_width": spec.transition_width.item()})
 
 
 def train_classification(model: str, seed: int, out: Path) -> None:
     if model.startswith("vit_"):
         train_vit_classification(model, seed, out)
+    elif model == "wrennet":
+        train_wrennet_classification(seed, out)
     else:
         import functools
         import baselines
@@ -367,12 +417,13 @@ def window_audio(audio: np.ndarray, b: np.ndarray, r: np.ndarray | None = None, 
 # --- detection: models -------------------------------------------------------------------------------------
 
 class Detector:
-    """One model of a detection experiment, behind the same calls for the ViT (PyTorch) and the
-    baselines (Keras): fit_batch, logits (float), int8 (after quantize), state for the best weights."""
+    """One model of a detection experiment, behind the same calls for the PyTorch models (the ViT,
+    WrenNet) and PolyChirp's (Keras): fit_batch, logits (float), int8 (after quantize), state for the
+    best weights."""
 
     def __init__(self, name: str, experiment: str, train: Recordings, seed: int):
         self.name, self.window = name, experiment == "detection_window"
-        self.vit = name.startswith("vit_")
+        self.vit, self.uses_torch = name.startswith("vit_"), uses_torch(name)
         if self.vit:
             import torch
             self.torch, self.dev = torch, torch_device()
@@ -383,6 +434,13 @@ class Detector:
                                        for c in np.array_split(clips, 8)]).mean(0)
             self.opt = torch.optim.Adam(self.model.parameters(), lr=P["lr"], eps=P["adam_eps"])
             self.samples = SPAN * B
+        elif self.uses_torch:   # WrenNet: one logit per 3 s window
+            import torch
+            import baselines
+            self.torch, self.dev = torch, torch_device()
+            self.model = baselines.wrennet(1).to(self.dev)
+            self.opt = torch.optim.Adam(baselines.wrennet_parameters(self.model, P["lr"]), eps=P["adam_eps"])
+            self.samples = CLIP
         else:
             import keras
             import baselines
@@ -391,23 +449,30 @@ class Detector:
             self.samples = CLIP
         self.binary = self.tflite = None
 
-    # the ViT's outputs: buffer logits [n, buffers]; a window decision: their smooth max
-    def _vit_buffers(self, x):
-        return self.model(x, m_init=self.m0.expand(len(x), -1))[..., 0]
+    # the PyTorch models' outputs on int16 audio [n, samples]: the ViT's buffer logits [n, buffers]
+    # (a window decision: their smooth max), WrenNet's window logits [n]
+    def _torch_out(self, audio):
+        if self.vit:
+            x = self.torch.from_numpy(audio.astype(np.float32)).to(self.dev)
+            return self.model(x, m_init=self.m0.expand(len(x), -1))[..., 0]
+        import baselines
+        return self.model(self.torch.from_numpy(baselines.wrennet_input(audio / 32768)).to(self.dev))[:, 0]
 
     def _vit_window(self, z):
         import vit
         return vit.window_logit(z[..., None], CONFIG["vit"]["readout"]["temperature"])
 
+    def _window(self, z):
+        return self._vit_window(z) if self.vit else z
+
     def fit_batch(self, audio: np.ndarray, y: np.ndarray, warmup: int = 0) -> float:
         """One step on int16 audio [n, samples] with targets: per buffer [n, buffers] (stream) or per window [n]."""
-        if self.vit:
+        if self.uses_torch:
             torch, F = self.torch, self.torch.nn.functional
             self.model.train()
-            x, y = torch.from_numpy(audio.astype(np.float32)).to(self.dev), torch.from_numpy(y.astype(np.float32)).to(self.dev)
-            z = self._vit_buffers(x)
+            z, y = self._torch_out(audio), torch.from_numpy(y.astype(np.float32)).to(self.dev)
             if self.window:
-                loss = F.binary_cross_entropy_with_logits(self._vit_window(z), y)
+                loss = F.binary_cross_entropy_with_logits(self._window(z), y)
             else:
                 z, y = z[:, warmup:], y[:, warmup:]
                 keep = (y != IGNORE).float()
@@ -420,27 +485,27 @@ class Detector:
 
     def logits(self, audio: np.ndarray) -> np.ndarray:
         """Float logits: per buffer [n, buffers] (stream) or per window [n]."""
-        if self.vit:
+        if self.uses_torch:
             self.model.eval()
             with self.torch.no_grad():
-                z = self._vit_buffers(self.torch.from_numpy(audio.astype(np.float32)).to(self.dev))
-                return (self._vit_window(z) if self.window else z).cpu().numpy()
+                z = self._torch_out(audio)
+                return (self._window(z) if self.window else z).cpu().numpy()
         p = np.asarray(self.model.predict_on_batch(self.features((audio / 32768).astype(np.float32))))[:, 0]
         return np.log(np.clip(p, 1e-6, 1 - 1e-6) / np.clip(1 - p, 1e-6, 1))
 
     def state(self):
-        return {k: v.detach().clone() for k, v in self.model.state_dict().items()} if self.vit else self.model.get_weights()
+        return {k: v.detach().clone() for k, v in self.model.state_dict().items()} if self.uses_torch else self.model.get_weights()
 
     def load(self, state) -> None:
-        self.model.load_state_dict(state) if self.vit else self.model.set_weights(state)
+        self.model.load_state_dict(state) if self.uses_torch else self.model.set_weights(state)
 
     def step(self, protocol: Protocol, epoch: int, score: float, best: list, **losses) -> bool:
-        lr = self.opt.param_groups[0]["lr"] if self.vit else float(self.model.optimizer.learning_rate.numpy())
+        lr = self.opt.param_groups[0]["lr"] if self.uses_torch else float(self.model.optimizer.learning_rate.numpy())
         improved, reduce, stop = protocol.step(epoch, score, lr, **losses)
         if improved:
             best[:] = [self.state()]
         if reduce:
-            if self.vit:
+            if self.uses_torch:
                 for g in self.opt.param_groups:
                     g["lr"] = max(g["lr"] * P["lr_factor"], P["lr_min"])
             else:
@@ -448,7 +513,7 @@ class Detector:
         return stop
 
     def quantize(self, calib_audio: np.ndarray, out: Path) -> None:
-        """INT8 version of a causal ViT (export.py) or of a baseline (PolyChirp's TFLite recipe)."""
+        """INT8 version of a causal ViT (export.py) or of a PolyChirp model (PolyChirp's TFLite recipe)."""
         if self.vit:
             if not self.model.causal:
                 return
@@ -526,7 +591,7 @@ def train_detection(experiment: str, model_name: str, seed: int, out: Path) -> N
     if det.window:
         vr, vb, vy = window_targets(val_labels)
     protocol, best = Protocol(), []
-    note(t0, f"training on {torch_name(det.dev) if det.vit else tensorflow_name()}: {EPOCH_HOURS} h of audio per epoch, "
+    note(t0, f"training on {torch_name(det.dev) if det.uses_torch else tensorflow_name()}: {EPOCH_HOURS} h of audio per epoch, "
              f"{len(data['train'].names)} train / {len(data['val'].names)} val recordings")
     for epoch in range(P["epochs"]):
         audio, labels = data["train"].region_batch(data["train"].regions(n_regions(EPOCH_HOURS), regions_rng))
@@ -549,9 +614,10 @@ def train_detection(experiment: str, model_name: str, seed: int, out: Path) -> N
             break
     det.load(best[0])
     out.mkdir(parents=True, exist_ok=True)
-    note(t0, "INT8 version" + (" (export/)" if det.vit else " (model.tflite)"))
-    # INT8 calibration from the validation days: 240 windows for the ViT (export.py), 2000 for PolyChirp's TFLite recipe
-    det.quantize(data["val"].clips(CONFIG["vit"]["calibration_clips"] if det.vit else 2000, det.samples, np.random.default_rng(2)), out)
+    if det.name != "wrennet":   # float only
+        note(t0, "INT8 version" + (" (export/)" if det.vit else " (model.tflite)"))
+        # INT8 calibration from the validation days: 240 windows for the ViT (export.py), 2000 for PolyChirp's TFLite recipe
+        det.quantize(data["val"].clips(CONFIG["vit"]["calibration_clips"] if det.vit else 2000, det.samples, np.random.default_rng(2)), out)
     scores = {}
     for split in ("val", "ssw_test", "sne_test"):
         d = data[split]
@@ -596,7 +662,7 @@ def torch_device():
         if (int(cc) // 10 == major and int(cc) % 10 <= minor) or (kind == "compute" and divmod(int(cc), 10) <= (major, minor)):
             return torch.device("cuda", 0)
     say(f"{torch.cuda.get_device_name(0)} (compute capability {major}.{minor}): this PyTorch build has no kernels "
-        f"for it ({', '.join(torch.cuda.get_arch_list())}), the ViT trains on the CPU")
+        f"for it ({', '.join(torch.cuda.get_arch_list())}), the PyTorch models train on the CPU")
     return torch.device("cpu")
 
 
@@ -653,12 +719,12 @@ def run_one(experiment: str, model: str, seed: int) -> None:
     tmp.mkdir(parents=True)
     sys.stdout = Tee(sys.__stdout__, open(tmp / "train.log", "w"))
     say(f"=== {experiment} {model} seed {seed}")
-    if model.startswith("vit_") or not tensorflow_gpu_ok():
-        # the ViT: TensorFlow only reads PolyChirp's data, the GPU is PyTorch's. PolyChirp's models on a GPU
-        # TensorFlow 2.16 has no kernels for (Blackwell, compute capability 12): on the CPU, slower.
+    if uses_torch(model) or not tensorflow_gpu_ok():
+        # PyTorch's models: TensorFlow only reads PolyChirp's data, the GPU is PyTorch's. PolyChirp's models
+        # on a GPU TensorFlow 2.16 has no kernels for (Blackwell, compute capability 12): on the CPU, slower.
         import tensorflow as tf
         tf.config.set_visible_devices([], "GPU")
-    seed_everything(seed, model.startswith("vit_"))
+    seed_everything(seed, uses_torch(model))
     t0 = time.time()
     (train_classification(model, seed, tmp) if experiment == "classification" else train_detection(experiment, model, seed, tmp))
     tmp.rename(out)

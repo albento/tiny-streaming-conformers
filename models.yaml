@@ -27,7 +27,8 @@ vit:
   readout: {tau_s: 0.5, skip: 5, temperature: 5.0}   # vit.clip_logits / vit.window_logit
   calibration_clips: 240         # INT8 calibration (export.py), drawn from the validation split
 
-# PolyChirp's models (baselines.py), each on the front end PolyChirp assigns it.
+# The baselines (baselines.py): PolyChirp's models, each on the front end PolyChirp assigns it, and
+# WrenNet, its authors' code (submodule wrennet/).
 baselines: [mel_polychirp_x2, mel_polychirp_x3, wrennet]
 
 # The experiments: which models each one trains (the ViT ids are expanded over stems, layers and

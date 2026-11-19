@@ -132,8 +132,8 @@ def detection_rows(run: Path, splits: dict, box: dict) -> list[dict]:
                 rec_t = tot_t = hit = n_box = 0
                 for (c, f, _), z in zip(keys, z_all):
                     rec = recorded(z, th, preroll, tail)
-                    b = box[c].get(f, np.zeros((0, 2), int))
-                    b = b[b[:, 1] > SKIP]
+                    b = np.minimum(box[c].get(f, np.zeros((0, 2), int)), len(z))   # a box may end in the last, partial buffer
+                    b = b[(b[:, 1] > SKIP) & (b[:, 0] < len(z))]
                     rec_t, tot_t = rec_t + rec.sum(), tot_t + len(z) - SKIP
                     hit += int((span_sums(np.concatenate([[0], np.cumsum(rec)]), b) > 0).sum()) if len(b) else 0
                     n_box += len(b)
@@ -229,6 +229,36 @@ def baseline_costs(model: str, run: Path) -> dict:
     return out
 
 
+def wrennet_costs() -> dict:
+    """WrenNet's parameters and MACs, counted as baseline_costs counts PolyChirp's models: the layers with
+    weights (convolutions, GRU, linear), the attention pooling's weighted sum, the 32 kHz STFT and filter
+    bank. No flash or RAM: no INT8 version."""
+    import torch
+    import baselines
+    model = baselines.wrennet(1).eval()
+    macs = 0
+
+    def count(layer, args, out):
+        nonlocal macs
+        o = (out[0] if isinstance(out, tuple) else out).shape
+        if isinstance(layer, torch.nn.Conv1d):
+            macs += o[-1] * layer.kernel_size[0] * layer.in_channels // layer.groups * layer.out_channels
+        elif isinstance(layer, torch.nn.Linear):
+            macs += math.prod(o[:-1]) * layer.in_features * layer.out_features
+        elif isinstance(layer, torch.nn.GRU):
+            macs += o[1] * 3 * (layer.input_size + layer.hidden_size) * layer.hidden_size
+    for layer in model.modules():
+        layer.register_forward_hook(count)
+    with torch.no_grad():
+        model(torch.zeros(1, 2 * 48000))
+    w = baselines.WRENNET
+    frames = 2 * 48000 // w["hop_length"] + 1
+    bank = model.combined_log_linear_spec._get_current_filter_bank("cpu")
+    window_macs = macs + frames * w["hidden_dim"] + frames * stft_macs(w["n_fft"], 0, int((bank > 0).sum()))
+    return {"parameters": sum(p.numel() for p in model.parameters()), "macs_per_s_window": window_macs / (23 * BUFFER_S),
+            "macs_per_s_clip": window_macs / 3.0}
+
+
 KEYS = ["experiment", "model", "seed"]
 
 
@@ -278,7 +308,8 @@ def main():
     costs = []
     for model in sorted({run.parts[-2] for run in RUNS.glob("*/*/seed_*")} - (set() if args.redo else known)):
         run = next(iter(sorted(RUNS.glob(f"*/{model}/seed_*"))))
-        costs.append({"model": model, **(vit_costs(model, run) if re.match(r"vit_", model) else baseline_costs(model, run))})
+        costs.append({"model": model, **(vit_costs(model, run) if re.match(r"vit_", model) else
+                                         wrennet_costs() if model == "wrennet" else baseline_costs(model, run))})
     merge(path, costs, ["model"], {(c["model"],) for c in costs})
 
 if __name__ == "__main__":
