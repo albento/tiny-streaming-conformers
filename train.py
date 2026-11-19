@@ -325,13 +325,13 @@ def train_wrennet_classification(seed: int, out: Path) -> None:
     model = baselines.wrennet(len(labels)).to(dev)
     opt = torch.optim.Adam(baselines.wrennet_parameters(model, P["lr"]), eps=P["adam_eps"])
     note(t0, f"training on {torch_name(dev)}")
-    protocol = fit(model, opt, train_ds, val_ds, baselines.wrennet_input, lambda x, train: model(x), dev)
+    protocol = fit(model, opt, train_ds, val_ds, baselines.wrennet_input, lambda x, train: baselines.wrennet_forward(model, x), dev)
     out.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict()}, out / "model.pt")
 
     def probability(x):
         with torch.no_grad():
-            return torch.sigmoid(model(torch.from_numpy(x).to(dev))).cpu().numpy()
+            return torch.sigmoid(baselines.wrennet_forward(model, torch.from_numpy(x).to(dev))).cpu().numpy()
     write_scores(out, t0, labels, tune_ds, val_ds, test_ds, baselines.wrennet_input, probability)
     spec = model.combined_log_linear_spec
     save_json(out / "train.json", protocol, t0, parameters=sum(p.numel() for p in model.parameters()),
@@ -456,7 +456,7 @@ class Detector:
             x = self.torch.from_numpy(audio.astype(np.float32)).to(self.dev)
             return self.model(x, m_init=self.m0.expand(len(x), -1))[..., 0]
         import baselines
-        return self.model(self.torch.from_numpy(baselines.wrennet_input(audio / 32768)).to(self.dev))[:, 0]
+        return baselines.wrennet_forward(self.model, self.torch.from_numpy(baselines.wrennet_input(audio / 32768)).to(self.dev))[:, 0]
 
     def _vit_window(self, z):
         import vit

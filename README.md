@@ -39,7 +39,8 @@ source .venv/bin/activate        # or prefix every command with `uv run`
 
 - GPU: tested on an NVIDIA L40S; needs an NVIDIA driver ≥ 580 (CUDA 13). Each framework falls back
   to the CPU, with a message, on GPUs it has no kernels for: PolyChirp's TensorFlow 2.16 on Blackwell
-  (compute capability 12), our ViT's PyTorch on V100 and older (below 7.5).
+  (compute capability 12), our ViT's PyTorch on V100 and older (below 7.5; on a V100, see
+  [PyTorch on a V100](#pytorch-on-a-v100)).
 - `gcc` (host inference of the INT8 ViT) and, for the firmware and the RAM figures,
   `arm-none-eabi-gcc` on the `PATH`.
 - `XC_API_KEY=<your Xeno-Canto API key>` in `polychirp/.env` (classification data only).
@@ -77,6 +78,25 @@ uv run train.py ...              # or source $UV_PROJECT_ENVIRONMENT/bin/activat
 
 Keep the cache on the virtualenv's file system: uv then hard-links the packages instead of copying
 them. Moving an existing virtualenv breaks it: delete it and run `uv sync` again.
+
+### PyTorch on a V100
+
+The locked PyTorch (CUDA 13) has no kernels for the V100 (compute capability 7.0): the PyTorch
+models would train on the CPU. PyTorch 2.14.1 for CUDA 12.6 has them, and gives the same outputs and
+gradients as the locked version. Once, after `uv sync`:
+
+```sh
+uv pip install -p "${UV_PROJECT_ENVIRONMENT:-.venv}" torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126
+```
+
+(`--index-url` alone: an `--extra-index-url` of PyPI would take precedence and bring back a CUDA 13
+build.) Then `UV_NO_SYNC=1` in `.env`, so that `uv run` keeps this PyTorch instead of the locked one;
+after a `git pull` that changes `uv.lock`, run `uv sync` and the line above again. Check:
+`uv run python -c "import torch; print(torch.cuda.get_arch_list())"` lists `sm_70`.
+
+This virtualenv is for the PyTorch models only (our ViTs, WrenNet): PyTorch 2.14.1 brings cuDNN 9,
+which replaces TensorFlow 2.16's cuDNN 8.9, so PolyChirp's models cannot use the GPU there. For the
+PyTorch models, TensorFlow only reads the data, GPU hidden.
 
 ## Data
 

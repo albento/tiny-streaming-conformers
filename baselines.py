@@ -221,7 +221,34 @@ def wrennet_parameters(model, lr: float) -> list[dict]:
 
 
 def wrennet_input(audio) -> np.ndarray:
-    """Audio [n, samples] in [-1, 1] at 16 kHz (PolyChirp's clips, the soundscapes) -> 32 kHz, WrenNet's
-    rate: our data hold nothing above 8 kHz (PolyChirp kept 16 kHz clips only), WrenNet sees what every model sees."""
-    from scipy.signal import resample_poly
-    return resample_poly(np.asarray(audio, np.float32).reshape(len(audio), -1), 2, 1, axis=1).astype(np.float32)
+    """Audio [n, samples] in [-1, 1] at 16 kHz (PolyChirp's clips, the soundscapes), as float32 [n, samples]:
+    still 16 kHz, wrennet_forward brings it to WrenNet's 32 kHz on the model's device."""
+    return np.asarray(audio, np.float32).reshape(len(audio), -1)
+
+
+_UPSAMPLE = {}
+
+
+def upsample2(x):
+    """scipy.signal.resample_poly(x, 2, 1, axis=1) on x's device: torch [n, samples] -> [n, 2 samples].
+    Its filter (firwin, 41 taps, Kaiser 5, cut-off at the old Nyquist, times 2) after one zero, applied
+    to x with a zero after every sample; the output keeps samples 21 .. 21 + 2 samples of the full
+    convolution, as scipy's. On the GPU: the CPU no longer slows the training down (scipy, one core,
+    each window resampled for every decision it belongs to)."""
+    import torch
+    import torch.nn.functional as F
+    from scipy.signal import firwin
+    key = (x.device, x.dtype)
+    if key not in _UPSAMPLE:
+        h = np.concatenate([[0.0], firwin(41, 0.5, window=("kaiser", 5.0)).astype(np.float32) * 2])
+        _UPSAMPLE[key] = torch.from_numpy(h[::-1].copy()).to(x)[None, None]   # conv1d correlates: the flipped filter
+    w = _UPSAMPLE[key]
+    up = torch.zeros(x.shape[0], 2 * x.shape[1], dtype=x.dtype, device=x.device)
+    up[:, ::2] = x
+    full = F.conv1d(F.pad(up, (w.shape[-1] - 1, w.shape[-1] - 1))[:, None], w)[:, 0]
+    return full[:, 21:21 + up.shape[1]]
+
+
+def wrennet_forward(model, x):
+    """WrenNet's logits for 16 kHz audio x (torch [n, samples] in [-1, 1], on the model's device): 32 kHz first."""
+    return model(upsample2(x))
