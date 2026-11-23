@@ -7,6 +7,9 @@
   the seeds share, which the confidence intervals of the two means keep): the mean difference
   model_b - model_a over the seeds both have, its 95 % confidence interval (Student's t), the paired
   t-test's p and its Holm correction over the pairs of the same experiment, set, kind and metric.
+  detection_paired.csv also has the cost of streaming, experiment "stream_vs_window_nc": each causal
+  ViT in streaming (detection_stream, model_b) against its non-causal variant on 3 s windows
+  (detection_window, model_a = <model>_nc), its best potential; Holm over these pairs.
 
     uv run aggregate.py         # -> results/{classification,detection}_{summary,paired}.csv
 """
@@ -40,13 +43,27 @@ def holm(p: pd.Series) -> pd.Series:
     return pd.Series(adjusted, index=q.index).reindex(p.index)
 
 
+def stream_vs_window_nc(runs: pd.DataFrame) -> pd.DataFrame:
+    """The detection runs recast as one pseudo-experiment "stream_vs_window_nc": every causal ViT of
+    detection_stream and the non-causal variant (<model>_nc) of detection_window, for paired()."""
+    stream = runs[runs.experiment == "detection_stream"]
+    window = runs[(runs.experiment == "detection_window") & runs.model.isin(stream.model + "_nc")]
+    return pd.concat([stream, window]).assign(experiment="stream_vs_window_nc")
+
+
 def paired(runs: pd.DataFrame) -> pd.DataFrame:
     metrics = [c for c in runs.columns if c not in KEYS + ["seed"]]
     rows = []
     for (experiment, split, kind), g in runs.groupby(["experiment", "split", "kind"], sort=False):
+        if experiment == "stream_vs_window_nc":   # only each model against its own non-causal variant
+            pairs = [(f"{m}_nc", m) for m in g.model.unique() if f"{m}_nc" in set(g.model)]
+        else:
+            pairs = None
         for metric in metrics:
             table = g.pivot(index="seed", columns="model", values=metric)
-            for a, b in itertools.combinations(table.columns, 2):
+            for a, b in pairs if pairs is not None else itertools.combinations(table.columns, 2):
+                if a not in table or b not in table:
+                    continue
                 d = (table[b] - table[a]).dropna()
                 n = len(d)
                 if n < 2:
@@ -70,7 +87,10 @@ def main():
             summary = summarize(pd.read_csv(path), costs)
             summary.to_csv(RESULTS / f"{name}_summary.csv", index=False, float_format="%.6g")
             print(summary.to_string(index=False, max_cols=12))
-            pairs = paired(pd.read_csv(path))
+            runs = pd.read_csv(path)
+            if name == "detection":
+                runs = pd.concat([runs, stream_vs_window_nc(runs)], ignore_index=True)
+            pairs = paired(runs)
             pairs.to_csv(RESULTS / f"{name}_paired.csv", index=False, float_format="%.6g")
             print(f"{name}_paired.csv: {len(pairs)} comparisons")
 

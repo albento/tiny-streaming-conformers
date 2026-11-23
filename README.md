@@ -14,12 +14,13 @@ WrenNet on bird species classification and on bird / no-bird detection in long r
 | `vit.py` | our ViT (PyTorch), nothing else |
 | `baselines.py` | the baselines: PolyChirp's Mel-PolyChirp ×2 / ×3 (and our changes to PolyChirp), WrenNet's original code |
 | `prepare_classification.py` | builds PolyChirp's Paris dataset |
-| `prepare_detection.py` | downloads and labels the SSW / SNE soundscapes |
+| `prepare_detection.py` | downloads and labels the SSW soundscapes |
 | `train.py` | trains any model of any experiment |
 | `evaluate.py` | runs → CSV (`results/*_runs.csv`, `results/costs.csv`) |
 | `aggregate.py` | CSV → mean ± standard error per model (`results/*_summary.csv`), paired comparisons (`results/*_paired.csv`) |
 | `plot.py` | figures (`results/figures/`) |
 | `export.py` | INT8 export of the ViT to C, host inference, AudioMoth firmware |
+| `audiomoth.py` | the firmware's CSV files (SD card) → latency and RAM measured on the AudioMoth, into `results/costs.csv` |
 | `firmware/` | the ViT and front end in C; AudioMoth, CMSIS as submodules |
 | `polychirp/` | PolyChirp (submodule, never modified) |
 | `wrennet/` | WrenNet, its authors' code (submodule, never modified) |
@@ -102,7 +103,7 @@ PyTorch models, TensorFlow only reads the data, GPU hidden.
 
 ```sh
 uv run prepare_classification.py     # PolyChirp's Paris dataset, into polychirp/ (git-ignored folders)
-uv run prepare_detection.py          # SSW + SNE: ~31 GB downloaded, ~60 GB on disk, into data/
+uv run prepare_detection.py          # SSW: ~26 GB downloaded, ~57 GB on disk, into data/
 ```
 
 Both resume where they stopped.
@@ -125,7 +126,7 @@ not the same clips.
 
 **Detection**: the Cornell Lab's fully annotated soundscapes (Kahl et al., Zenodo, CC BY 4.0), part
 of BirdSet. SSW (Sapsucker Woods, 285 h) is split by recording day into train / val / test (≈ 70 /
-15 / 15 %, seed 42); SNE (Sierra Nevada, 33 h) is a test set from a site never seen in training.
+15 / 15 %, seed 42).
 
 ### Labels
 
@@ -142,7 +143,7 @@ only the 10 ms frames where the box's band rises above the local noise:
    always kept; boxes < 1 s kept whole;
 5. a buffer is bird if a bird frame falls in it, else uncertain if a box covers it, else no bird.
 
-SSW: 18.4 % bird, 4.8 % uncertain; SNE: 33.4 % bird, 16.3 % uncertain. Inspect any stretch with
+SSW: 18.4 % bird, 4.8 % uncertain. Inspect any stretch with
 `uv run plot.py labels <recording> --start <s> --end <s>`.
 
 ## Models
@@ -253,9 +254,10 @@ runs present). The curves need each run's scores (`scores.npz` or `results.npz`,
 
 - Classification (test clips): macro F2 at per-class thresholds tuned on train + val (PolyChirp's
   evaluation), macro average precision, clip error (predicted set of species ≠ true set).
-- Detection (SSW test days, SNE), the first 8 s of every recording left out:
+- Detection (SSW test days), the first 8 s of every recording left out:
   - segment ROC (AUC, AP) on common 1.47 s segments, positive when they overlap an annotation box; a
-    model's score is its highest decision judging the segment;
+    model's score combines its decisions judging the segment: the max of the 23 buffers' (streaming;
+    each judges a part of it), the mean of the two 3 s windows containing it (each judges all of it);
   - the AudioMoth's triggered recording simulated on the scores (a recording starts with a
     pre-roll and ends 1.5 s after the last detection): time recorded vs annotation boxes captured,
     summarized as the time needed for 80 / 90 % of the boxes and the boxes captured with 20 / 30 % of
@@ -269,11 +271,25 @@ runs present). The curves need each run's scores (`scores.npz` or `results.npz`,
 
 ```sh
 uv run export.py runs/classification/vit_s24_l3/seed_0     # -> audiomoth_vit_s24_l3_seed_0.bin in that folder
+uv run export.py --all                                     # every causal ViT (detection_stream, seed 0) -> runs/audiomoth/
+uv run audiomoth.py <folder of the SD cards' CSV files>    # -> results/audiomoth.csv, ram_kb and latency_max_ms of results/costs.csv
 ```
 
 The latency-measuring firmware: the official AudioMoth firmware (`firmware/AudioMoth-Firmware-Basic`,
 built with `firmware/AudioMoth-Project`) with the ViT added by `firmware/main.patch`. Flash it with the
-AudioMoth Flash App.
+AudioMoth Flash App and let it record (switch on CUSTOM, a schedule set with the AudioMoth Configuration
+App, or DEFAULT): each recording period runs the ViT on the microphone, at 16 kHz and at the full core
+clock whatever the configuration (sample rate and energy saver mode are ignored), and writes, instead of the WAV file, a CSV file
+with the cycles of the front end and of the ViT for every 64 ms buffer, the buffers skipped and the
+deepest stack. `audiomoth.py` reads them (any folder layout; each file names its model): the max and
+mean latency per buffer, real time when the max is under 64 ms and no buffer was skipped, and the RAM
+with the measured stack instead of the 1.4 KB estimate. `evaluate.py --redo` keeps these values.
+
+The EFM32 has 32 KB of RAM for the official firmware's state (about 19 KB), the ViT's and the front
+end's, a 2 KB heap and a 1 KB stack. When a model does not fit (the linker's "RAM memory overflowed!",
+the 3-layer ViTs), `export.py` builds it again with `-DVIT_NO_FREQUENCY_TRIGGER` (`firmware/main.patch`):
+without the 4 KB Hamming window of the official firmware's frequency trigger, which only `makeRecording()`
+uses and this firmware never calls. That `.bin` is named `..._no_freq_trigger.bin`.
 
 ## Reproducibility
 

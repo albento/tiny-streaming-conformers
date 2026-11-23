@@ -384,7 +384,7 @@ class Recordings:
 def detection_data() -> dict[str, Recordings]:
     s = json.loads((DATA / "splits.json").read_text())
     return {"train": Recordings([("ssw", f) for f in s["ssw"]["train"]]), "val": Recordings([("ssw", f) for f in s["ssw"]["val"]]),
-            "ssw_test": Recordings([("ssw", f) for f in s["ssw"]["test"]]), "sne_test": Recordings([("sne", f) for f in s["sne"]["test"]])}
+            "ssw_test": Recordings([("ssw", f) for f in s["ssw"]["test"]])}
 
 
 def n_regions(hours: float) -> int:
@@ -619,7 +619,7 @@ def train_detection(experiment: str, model_name: str, seed: int, out: Path) -> N
         # INT8 calibration from the validation days: 240 windows for the ViT (export.py), 2000 for PolyChirp's TFLite recipe
         det.quantize(data["val"].clips(CONFIG["vit"]["calibration_clips"] if det.vit else 2000, det.samples, np.random.default_rng(2)), out)
     scores = {}
-    for split in ("val", "ssw_test", "sne_test"):
+    for split in ("val", "ssw_test"):
         d = data[split]
         note(t0, f"scoring {split}: {len(d.names)} recordings, float" + (" and INT8" if det.binary or det.tflite else ""))
         for name, audio, n in zip(d.names, d.audio, d.buffers):

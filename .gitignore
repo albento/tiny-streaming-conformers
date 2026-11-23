@@ -224,7 +224,8 @@ __marimo__/
 
 # tiny-streaming-conformers: training runs (weights, scores) and datasets are not versioned;
 # results/ (CSV and figures) is
-runs/
+runs/*
+!runs/audiomoth/
 data/
 *.partial/
 # .env is versioned with empty values (the default folders); set your own paths in it

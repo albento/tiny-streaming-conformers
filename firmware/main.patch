@@ -45,10 +45,30 @@
  /* Useful time constants */
  
  #define MICROSECONDS_IN_SECOND                  1000000
-@@ -1475,6 +1483,52 @@
+@@ -494,7 +502,9 @@
+ 
+ static bool isEnergySaverMode(configSettings_t *configSettings) {
+ 
+-    return configSettings->enableEnergySaverMode && configSettings->sampleRate / configSettings->sampleRateDivider <= ENERGY_SAVER_SAMPLE_RATE_THRESHOLD;
++    /* ViT latency firmware: never, so that the core runs at its full clock whatever the configuration */
++
++    return false && configSettings->enableEnergySaverMode && configSettings->sampleRate / configSettings->sampleRateDivider <= ENERGY_SAVER_SAMPLE_RATE_THRESHOLD;
+ 
+ }
+ 
+@@ -1475,6 +1485,61 @@
  
  static int16_t secondaryBuffer[MAXIMUM_SAMPLES_IN_DMA_TRANSFER];
  
++/* ViT latency: 16 kHz whatever the configuration, with the AudioMoth Configuration App's settings for
++   16 kHz (384 kHz sampling divided by 24); the gain and the other settings are the configuration's */
++
++#define VIT_CLOCK_DIVIDER                        4
++#define VIT_ACQUISITION_CYCLES                   16
++#define VIT_OVERSAMPLE_RATE                      1
++#define VIT_SAMPLE_RATE                          384000
++#define VIT_SAMPLE_RATE_DIVIDER                  24
++
 +/* ViT latency: the DMA interrupt filters the samples (16 kHz) into two 1024-sample buffers; the main
 +   loop runs the front end and the ViT on each full one. A buffer that completes while both are full
 +   is skipped (counted), so a slow inference never stalls the acquisition. */
@@ -65,11 +85,11 @@
 +
 +    if (vitFull[vitFill] == false) {
 +
-+        DigitalFilter_applyFilter(source, vitAudio[vitFill] + vitIndex, configSettings->sampleRateDivider, numberOfRawSamplesInDMATransfer);
++        DigitalFilter_applyFilter(source, vitAudio[vitFill] + vitIndex, VIT_SAMPLE_RATE_DIVIDER, numberOfRawSamplesInDMATransfer);
 +
 +    }
 +
-+    vitIndex += numberOfRawSamplesInDMATransfer / configSettings->sampleRateDivider;
++    vitIndex += numberOfRawSamplesInDMATransfer / VIT_SAMPLE_RATE_DIVIDER;
 +
 +    if (vitIndex >= FRONTEND_BUFFER_SAMPLES) {
 +
@@ -98,7 +118,7 @@
  /* Firmware version and description */
  
  static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 12, 0};
-@@ -1485,6 +1539,8 @@
+@@ -1485,6 +1550,8 @@
  
  static AM_recordingState_t makeRecording(uint32_t timeOfNextRecording, uint32_t recordDuration, uint32_t timeAtWhichToSwitchOffLED, AM_extendedBatteryState_t extendedBatteryState, int32_t temperature, uint32_t *fileOpenTime, uint32_t *fileOpenMilliseconds);
  
@@ -107,7 +127,7 @@
  static void scheduleRecording(uint32_t currentTime, uint32_t *timeOfNextRecording, uint32_t *indexOfNextRecording, uint32_t *durationOfNextRecording, uint32_t *startOfRecordingPeriod, uint32_t *endOfRecordingPeriod);
  
  static void determineTimeOfNextSunriseSunsetCalculation(uint32_t currentTime, uint32_t *timeOfNextSunriseSunsetCalculation);
-@@ -2225,7 +2281,7 @@
+@@ -2225,7 +2292,7 @@
  
              if (fileSystemEnabled)  {
  
@@ -116,7 +136,7 @@
  
              } else {
  
-@@ -2759,6 +2815,14 @@
+@@ -2759,6 +2826,14 @@
  
      if (isPrimaryBuffer) source = primaryBuffer;
  
@@ -131,7 +151,7 @@
      /* Apply filter to samples */
  
      bool thresholdExceeded = DigitalFilter_applyFilter(source, buffers[writeBuffer] + writeBufferIndex, configSettings->sampleRateDivider, numberOfRawSamplesInDMATransfer);
-@@ -3091,6 +3155,198 @@
+@@ -3091,6 +3166,186 @@
  
  /* Save recording to SD card */
  
@@ -148,11 +168,11 @@
 +
 +    /* Microphone, DMA and filter as makeRecording() sets them, with the DC-blocking high-pass only */
 +
-+    uint32_t effectiveSampleRate = configSettings->sampleRate / configSettings->sampleRateDivider;
++    uint32_t effectiveSampleRate = VIT_SAMPLE_RATE / VIT_SAMPLE_RATE_DIVIDER;
 +
 +    DigitalFilter_designHighPassFilter(effectiveSampleRate, DEFAULT_DC_BLOCKING_FREQ);
 +
-+    numberOfRawSamplesInDMATransfer = MAXIMUM_SAMPLES_IN_DMA_TRANSFER / configSettings->sampleRateDivider;
++    numberOfRawSamplesInDMATransfer = MAXIMUM_SAMPLES_IN_DMA_TRANSFER / VIT_SAMPLE_RATE_DIVIDER;
 +
 +    while (numberOfRawSamplesInDMATransfer & (numberOfRawSamplesInDMATransfer - 1)) {
 +
@@ -160,7 +180,7 @@
 +
 +    }
 +
-+    numberOfRawSamplesInDMATransfer *= configSettings->sampleRateDivider;
++    numberOfRawSamplesInDMATransfer *= VIT_SAMPLE_RATE_DIVIDER;
 +
 +    microphoneChanged = false;
 +
@@ -176,11 +196,11 @@
 +
 +    AM_gainRange_t gainRange = configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
 +
-+    AM_externalMicrophone_t externalMicrophone = AudioMoth_enableMicrophone(gainRange, configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
++    AM_externalMicrophone_t externalMicrophone = AudioMoth_enableMicrophone(gainRange, configSettings->gain, VIT_CLOCK_DIVIDER, VIT_ACQUISITION_CYCLES, VIT_OVERSAMPLE_RATE);
 +
 +    AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, numberOfRawSamplesInDMATransfer);
 +
-+    float sampleMultiplier = 16.0f / (float)(configSettings->oversampleRate * configSettings->sampleRateDivider);
++    float sampleMultiplier = 16.0f / (float)(VIT_OVERSAMPLE_RATE * VIT_SAMPLE_RATE_DIVIDER);
 +
 +    if (AudioMoth_hasInvertedOutput()) sampleMultiplier = -sampleMultiplier;
 +
@@ -220,18 +240,6 @@
 +                                    "buffer_index,frontend_cycles,vit_cycles,isr_cycles,skipped_buffers,tokens_done,frames_done,stack_max_bytes\n",
 +                              VIT_MODEL_TAG, VIT_DEPTH, VIT_CONTEXT_SIZE, VIT_STEM_TIME_STRIDE, effectiveSampleRate, SystemCoreClock);
 +
-+    if (effectiveSampleRate != 16000) {
-+
-+        length += sprintf(text + length, "# the ViT needs a 16 kHz sample rate: set it with the AudioMoth Configuration App\n");
-+
-+        FLASH_LED_IF_ENABLED_AND_RETURN_ON_ERROR(AudioMoth_writeToFile(text, length));
-+
-+        FLASH_LED_IF_ENABLED_AND_RETURN_ON_ERROR(AudioMoth_closeFile());
-+
-+        return RECORDING_OKAY;
-+
-+    }
-+
 +    /* The cycle counter; the RAM between the heap and the stack painted, to find the deepest stack */
 +
 +    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -260,7 +268,7 @@
 +
 +    vitRunning = true;
 +
-+    AudioMoth_startMicrophoneSamples(configSettings->sampleRate);
++    AudioMoth_startMicrophoneSamples(VIT_SAMPLE_RATE);
 +
 +    uint32_t next = 0, row = 0, skippedBefore = 0, buffersInPeriod = recordDuration * effectiveSampleRate / FRONTEND_BUFFER_SAMPLES;
 +
@@ -330,3 +338,32 @@
  static AM_recordingState_t makeRecording(uint32_t timeOfNextRecording, uint32_t recordDuration, uint32_t timeAtWhichToSwitchOffLED, AM_extendedBatteryState_t extendedBatteryState, int32_t temperature, uint32_t *fileOpenTime, uint32_t *fileOpenMilliseconds) {
  
      /* Initialise buffers */
+--- a/src/digitalfilter.c
++++ b/src/digitalfilter.c
+@@ -26,7 +26,15 @@
+ 
+ /* Goertzel filter constants */
+ 
++/* ViT latency firmware: -DVIT_NO_FREQUENCY_TRIGGER (export.py, only when the build overflows the 32 KB
++   of RAM) frees the 4 KB Hamming window of the Goertzel filter: the frequency trigger is set up only by
++   makeRecording(), which this firmware never calls, and DigitalFilter_setFrequencyTrigger() does nothing */
++
++#ifdef VIT_NO_FREQUENCY_TRIGGER
++#define MAXIMUM_HAMMING_WINDOW_LENGTH           1
++#else
+ #define MAXIMUM_HAMMING_WINDOW_LENGTH           1024
++#endif
+ 
+ #define MINIMUM_NUMBER_OF_ITERATIONS            16
+ 
+@@ -653,6 +661,10 @@
+ 
+ void DigitalFilter_setFrequencyTrigger(uint32_t windowLength, uint32_t sampleRate, uint32_t frequency, float percentageThreshold) {
+ 
++#ifdef VIT_NO_FREQUENCY_TRIGGER
++    return;
++#endif
++
+     goertzelFilterThreshold = 0.0f;
+ 
+     goertzelFilterWindowLength = windowLength;

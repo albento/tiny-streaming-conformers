@@ -1,7 +1,6 @@
-"""Prepares the two BirdSet soundscape collections of the detection task, from the Cornell Lab's
+"""Prepares the BirdSet soundscape collection of the detection task, from the Cornell Lab's
 fully-annotated recordings on Zenodo (Kahl et al., CC BY 4.0):
   ssw  Sapsucker Woods, New York: 285 one-hour recordings, 50,760 boxes (train / val / test)
-  sne  Sierra Nevada, California: 33 one-hour recordings, 20,147 boxes (test only: a site never seen)
 
     uv run prepare_detection.py                 # download, convert, label, split; resumes where it stopped
 
@@ -11,7 +10,7 @@ Into data/<name>/ (git-ignored; or DATA_DIR of .env):
   labels.npz                         one label per 64 ms buffer: 1 bird, 0 no bird, 255 uncertain
   refined_annotations.csv            the labels as intervals in seconds (active / uncertain)
 and data/splits.json: SSW split by recording day (all hours of a day on the same side; days shuffled
-with seed 42, about 70 / 15 / 15 % of the files), SNE all test.
+with seed 42, about 70 / 15 / 15 % of the files).
 
 Labels: an annotation box often spans a whole bout (the annotators could merge calls of a species
 less than 5 s apart). Inside every box, each 10 ms frame is kept as bird only where the box's
@@ -36,7 +35,7 @@ from scipy.signal import resample_poly
 
 from paths import DATA
 
-RECORDS = {"ssw": 7018484, "sne": 7050014}  # Zenodo
+RECORDS = {"ssw": 7018484}  # Zenodo
 SR, BUFFER, IGNORE = 16000, 1024, 255
 
 # label refinement (10 ms frames)
@@ -227,7 +226,7 @@ def main():
     for name in RECORDS:
         download(name)
         stems = sorted(prepare(name))
-        splits[name] = split_by_day(stems) if name == "ssw" else {"test": stems}
+        splits[name] = split_by_day(stems)
         lab = np.concatenate(list(np.load(DATA / name / "labels.npz").values()))
         print(f"{name}: {len(stems)} recordings, buffers {100 * (lab == 1).mean():.1f} % bird, "
               f"{100 * (lab == IGNORE).mean():.1f} % uncertain, " + ", ".join(f"{k} {len(v)}" for k, v in splits[name].items()))

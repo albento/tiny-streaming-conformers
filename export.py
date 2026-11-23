@@ -1,6 +1,7 @@
 """From a trained ViT to the AudioMoth: INT8 quantization, C export, host inference, firmware build.
 
     uv run export.py runs/classification/vit_s24_l2/seed_0      # .bin to flash, in that run folder
+    uv run export.py --all                                      # every causal ViT (detection_stream, seed 0), into runs/audiomoth/
 
 Quantization (symmetric, zero-point 0, CMSIS-NN / TFLite conventions):
 - int8 per-tensor weights; activation scales from percentiles of the activations of calibration
@@ -282,10 +283,15 @@ def host_logits(binary: Path, audio: np.ndarray, first_frame_seed: bool = False,
 
 # --- AudioMoth firmware ----------------------------------------------------------------------------
 
-def build_firmware(export_dir: Path, out_bin: Path, heap: str = "0x800") -> None:
+class RamOverflow(RuntimeError):
+    """The linker's "RAM memory overflowed!": static data + heap + stack over the 32 KB of the EFM32."""
+
+
+def build_firmware(export_dir: Path, out_bin: Path, heap: str = "0x800", no_frequency_trigger: bool = False) -> None:
     """The latency-measuring AudioMoth firmware for one export: AudioMoth-Project (build system) and
     AudioMoth-Firmware-Basic (firmware) as their submodules pin them, our C and the export copied in,
-    firmware/main.patch applied, then make (arm-none-eabi-gcc)."""
+    firmware/main.patch applied, then make (arm-none-eabi-gcc). no_frequency_trigger: without the
+    official firmware's frequency trigger, unused by this firmware, whose Hamming window takes 4 KB of RAM."""
     with tempfile.TemporaryDirectory() as tmp:
         b = Path(tmp) / "build"
         shutil.copytree(FIRMWARE / "AudioMoth-Project", b, ignore=shutil.ignore_patterns(".git"))
@@ -302,20 +308,68 @@ def build_firmware(export_dir: Path, out_bin: Path, heap: str = "0x800") -> None
             shutil.copytree(FIRMWARE / d, b / d, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
         subprocess.run(["patch", "-s", "-p1", "-i", str(FIRMWARE / "main.patch")], cwd=b, check=True)
         (b / "build" / "objects").mkdir(parents=True, exist_ok=True)
-        subprocess.run(["make", "-s", f"DFLAGS=-MMD -D__HEAP_SIZE={heap}"], cwd=b / "build", check=True)
+        flags = f"-MMD -D__HEAP_SIZE={heap}" + (" -DVIT_NO_FREQUENCY_TRIGGER" if no_frequency_trigger else "")
+        r = subprocess.run(["make", "-s", f"DFLAGS={flags}"], cwd=b / "build", capture_output=True, text=True)
+        if r.returncode:
+            if "RAM memory overflowed" in r.stderr:
+                raise RamOverflow(out_bin.name)
+            sys.stderr.write(r.stderr)
+            raise subprocess.CalledProcessError(r.returncode, r.args)
         shutil.copy(b / "build" / "audiomoth.bin", out_bin)
 
 
+def build_fitting(export_dir: Path, out_bin: Path) -> Path:
+    """build_firmware, again without the frequency trigger (4 KB of RAM) if the RAM overflows; the .bin
+    is then named ..._no_freq_trigger.bin. Returns its path."""
+    try:
+        build_firmware(export_dir, out_bin)
+        return out_bin
+    except RamOverflow:
+        out_bin = out_bin.with_name(out_bin.stem + "_no_freq_trigger.bin")
+        print(f"{export_dir.parent.parent.name}: RAM overflowed, built again without the frequency trigger's Hamming window", flush=True)
+        build_firmware(export_dir, out_bin, no_frequency_trigger=True)
+        return out_bin
+
+
+def causal_vit_runs(experiment: str, seed: int) -> list[Path]:
+    """The run of every causal ViT of an experiment with that seed and an INT8 export."""
+    from paths import RUNS
+    return sorted(r for r in (RUNS / experiment).glob(f"vit_*/seed_{seed}")
+                  if not r.parent.name.endswith("_nc") and (r / "export" / "vit_model.c").exists())
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Build the AudioMoth firmware (.bin) of a trained causal ViT run.")
-    parser.add_argument("run", type=Path, help="a run folder of train.py (runs/<task>/<model>/seed_<n>)")
+    from paths import RUNS
+    parser = argparse.ArgumentParser(description="Build the AudioMoth firmware (.bin) of a trained causal ViT run, or of all of them.")
+    parser.add_argument("run", type=Path, nargs="?", help="a run folder of train.py (runs/<task>/<model>/seed_<n>)")
+    parser.add_argument("--all", action="store_true", help="every causal ViT of --experiment, seed --seed, into --out")
+    parser.add_argument("--experiment", default="detection_stream", help="with --all (default: detection_stream, one output)")
+    parser.add_argument("--seed", type=int, default=0, help="with --all (default: 0; the latency does not depend on it)")
+    parser.add_argument("--out", type=Path, default=RUNS / "audiomoth", help="with --all: the folder of the .bin files")
     args = parser.parse_args()
+    if args.all == (args.run is not None):
+        parser.error("give a run folder or --all")
+    if args.all:
+        runs = causal_vit_runs(args.experiment, args.seed)
+        if not runs:
+            sys.exit(f"no causal ViT run with an INT8 export in {RUNS / args.experiment}/*/seed_{args.seed}")
+        args.out.mkdir(parents=True, exist_ok=True)
+        failed = []
+        for run in runs:
+            out = args.out / f"audiomoth_{run.parent.name}.bin"
+            print(f"{run.parent.name}: building", flush=True)
+            try:
+                print(build_fitting(run / "export", out), flush=True)
+            except (subprocess.CalledProcessError, RamOverflow):
+                failed.append(run.parent.name)
+                print(f"{run.parent.name}: build FAILED (see the messages above)", flush=True)
+        if failed:
+            sys.exit(f"{len(runs) - len(failed)} built, failed: {', '.join(failed)}")
+        return
     export_dir = args.run / "export"
     if not (export_dir / "vit_model.c").exists():
         sys.exit(f"{export_dir}: no INT8 export (only causal ViT runs have one)")
-    out = args.run / f"audiomoth_{args.run.parent.name}_{args.run.name}.bin"
-    build_firmware(export_dir, out)
-    print(out)
+    print(build_fitting(export_dir, args.run / f"audiomoth_{args.run.parent.name}_{args.run.name}.bin"))
 
 
 if __name__ == "__main__":

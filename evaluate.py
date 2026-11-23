@@ -11,10 +11,12 @@ Classification (PolyChirp's evaluation, the same for every model): per-class thr
 on the tuning set (train + val), then on the test clips: macro F2, macro average precision, and the
 clip error (share of clips whose predicted set of species is not exactly the true one).
 
-Detection, on the SSW test days and on SNE, the first 8 s of every recording left out:
+Detection, on the SSW test days, the first 8 s of every recording left out:
 - segment ROC: common 1.47 s segments (buffers [24 + 23 k, 46 + 23 k]), positive when they overlap an
-  annotation box; a model's segment score is the highest of its decisions that judge the segment
-  (streaming: its 23 buffers; 3 s windows: the two windows containing the segment). AUC and AP.
+  annotation box. A model's segment score combines its decisions that judge the segment: streaming,
+  the max of its 23 buffers' (each judges a part of the segment, which is positive if one part is);
+  3 s windows, the mean of the two windows containing it (each judges the whole segment, plus 1.47 s
+  before or after it: their max would let a bird in a neighbouring segment alone raise it). AUC and AP.
   Chance gives AUC 0.5 whatever the model's decision rate.
 - triggered recording, as the AudioMoth's triggered firmware: a decision above the threshold opens a
   recording with a pre-roll (0.77 s, or the 3 s a window decision judged) and keeps it open TAIL_S
@@ -24,7 +26,8 @@ Detection, on the SSW test days and on SNE, the first 8 s of every recording lef
 
 Costs per model: parameters; multiply-accumulates per second of audio, front end included (window,
 FFT, power, mel filterbank, PCEN; for the ViT the formula of vit.ViT.macs_per_buffer); flash and RAM
-(the ViT: its C compiled for the Cortex-M4; PolyChirp's models: their INT8 TFLite model's weights and
+(the ViT: its C compiled for the Cortex-M4, with the stack and the max latency measured on the AudioMoth
+once audiomoth.py has run; PolyChirp's models: their INT8 TFLite model's weights and
 peak tensor arena, plus the 3 s of audio they need).
 """
 import csv
@@ -88,11 +91,15 @@ def span_sums(cumsum: np.ndarray, spans: np.ndarray) -> np.ndarray:
 
 
 def segment_scores(z: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
-    """(segment starts, score): the max over the decisions at buffers [s + min(window, 23) - 1, s + max(window, 23) - 1]."""
+    """(segment starts, score) from the decisions at buffers [s + min(window, 23) - 1, s + max(window, 23) - 1]
+    (NaN where there is no decision): their max when each judges a part of the segment (window <= 23,
+    streaming), their mean when each judges all of it (window > 23: the two 3 s windows containing it)."""
     lo, hi = min(window, SEGMENT) - 1, max(window, SEGMENT) - 1
     starts = np.arange(FIRST_SEGMENT, len(z) - hi, SEGMENT)
     starts = starts[starts >= SKIP]
     seg = z[starts[:, None] + np.arange(lo, hi + 1)]
+    if window > SEGMENT:
+        return starts, np.nanmean(seg, axis=1)
     return starts, np.where(np.isnan(seg), -np.inf, seg).max(axis=1)
 
 
@@ -171,13 +178,16 @@ def vit_costs(model: str, run: Path) -> dict:
         out["macs_per_s_stream"] = vit.macs_per_buffer(vit.context) / BUFFER_S + front
         export = next(iter(sorted(RUNS.glob(f"*/{model}/seed_*/export"))), None)
         if export is not None:
-            out |= vit_memory(export)
+            import audiomoth   # measured on the device (audiomoth.py): RAM with the measured stack, max latency
+            m = audiomoth.measured().get(model)
+            out |= audiomoth.device_costs(model, export, m) if m else vit_memory(export)
     return out
 
 
-def vit_memory(export: Path) -> dict:
+def vit_memory(export: Path, stack_bytes: int = 1400) -> dict:
     """Flash (the model's C arrays) and static RAM (the ViT's and the front end's state) of the
-    Cortex-M4 build, plus one buffer of audio and of spectrogram and 1.4 KB of measured stack."""
+    Cortex-M4 build, plus one buffer of audio and of spectrogram and the stack (default: 1.4 KB, an
+    earlier measurement; audiomoth.py gives each model's own)."""
     import export as E
     sizes = {}
     with tempfile.TemporaryDirectory() as tmp:
@@ -194,7 +204,7 @@ def vit_memory(export: Path) -> dict:
             text, data, bss = map(int, subprocess.run(["arm-none-eabi-size", str(obj)], capture_output=True, text=True).stdout.splitlines()[1].split()[:3])
             sizes[src] = (text + data, data + bss)
     return {"flash_kb": (sizes["vit_model.c"][0] + sizes["pcen.c"][0]) / 1024,
-            "ram_kb": (sizes["vit_inference.c"][1] + sizes["frontend.c"][1] + 2 * B + 7 * 129 * 4 + 1400) / 1024}
+            "ram_kb": (sizes["vit_inference.c"][1] + sizes["frontend.c"][1] + 2 * B + 7 * 129 * 4 + stack_bytes) / 1024}
 
 
 def baseline_costs(model: str, run: Path) -> dict:
@@ -282,7 +292,7 @@ def main():
     tf.config.set_visible_devices([], "GPU")   # nothing here needs a GPU
     RESULTS.mkdir(exist_ok=True)
     splits = json.loads((DATA / "splits.json").read_text()) if (DATA / "splits.json").exists() else None
-    tests = {"ssw_test": [("ssw", f) for f in splits["ssw"]["test"]], "sne_test": [("sne", f) for f in splits["sne"]["test"]]} if splits else {}
+    tests = {"ssw_test": [("ssw", f) for f in splits["ssw"]["test"]]} if splits else {}
     box = None
     for name in ("classification", "detection"):
         path = RESULTS / f"{name}_runs.csv"
@@ -296,7 +306,7 @@ def main():
             if key in done and not args.redo and (name == "classification" or (run / "curves.npz").exists()):
                 continue   # already in the CSV (detection: and its curves for plot.py)
             if name == "detection" and box is None:
-                box = {c: boxes(c) for c in ("ssw", "sne")}
+                box = {"ssw": boxes("ssw")}
             found = classification_rows(run) if name == "classification" else detection_rows(run, tests, box)
             rows += [dict(zip(KEYS, key)) | r for r in found]
             replaced.add(key)
