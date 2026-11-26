@@ -20,7 +20,7 @@ WrenNet on bird species classification and on bird / no-bird detection in long r
 | `aggregate.py` | CSV → mean ± standard error per model (`results/*_summary.csv`), paired comparisons (`results/*_paired.csv`) |
 | `plot.py` | figures (`results/figures/`) |
 | `export.py` | INT8 export of the ViT to C, host inference, AudioMoth firmware |
-| `audiomoth.py` | the firmware's CSV files (SD card) → latency and RAM measured on the AudioMoth, into `results/costs.csv` |
+| `audiomoth.py` | the firmware's CSV files (SD card) → latency measured on the AudioMoth (and RAM), into `results/costs.csv` |
 | `firmware/` | the ViT and front end in C; AudioMoth, CMSIS as submodules |
 | `polychirp/` | PolyChirp (submodule, never modified) |
 | `wrennet/` | WrenNet, its authors' code (submodule, never modified) |
@@ -282,8 +282,9 @@ App, or DEFAULT): each recording period runs the ViT on the microphone, at 16 kH
 clock whatever the configuration (sample rate and energy saver mode are ignored), and writes, instead of the WAV file, a CSV file
 with the cycles of the front end and of the ViT for every 64 ms buffer, the buffers skipped and the
 deepest stack. `audiomoth.py` reads them (any folder layout; each file names its model): the max and
-mean latency per buffer, real time when the max is under 64 ms and no buffer was skipped, and the RAM
-with the measured stack instead of the 1.4 KB estimate. `evaluate.py --redo` keeps these values.
+mean latency per buffer, real time when the max is under 64 ms and no buffer was skipped, and the
+deepest stack (kept in `results/audiomoth.csv`; the RAM of `costs.csv` leaves the stack out).
+`evaluate.py --redo` keeps these values.
 
 The EFM32 has 32 KB of RAM for the official firmware's state (about 19 KB), the ViT's and the front
 end's, a 2 KB heap and a 1 KB stack. When a model does not fit (the linker's "RAM memory overflowed!",

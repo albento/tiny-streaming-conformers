@@ -26,7 +26,7 @@ Detection, on the SSW test days, the first 8 s of every recording left out:
 
 Costs per model: parameters; multiply-accumulates per second of audio, front end included (window,
 FFT, power, mel filterbank, PCEN; for the ViT the formula of vit.ViT.macs_per_buffer); flash and RAM
-(the ViT: its C compiled for the Cortex-M4, with the stack and the max latency measured on the AudioMoth
+(the ViT: its C compiled for the Cortex-M4, stack left out, and the max latency measured on the AudioMoth
 once audiomoth.py has run; PolyChirp's models: their INT8 TFLite model's weights and
 peak tensor arena, plus the 3 s of audio they need).
 """
@@ -178,16 +178,16 @@ def vit_costs(model: str, run: Path) -> dict:
         out["macs_per_s_stream"] = vit.macs_per_buffer(vit.context) / BUFFER_S + front
         export = next(iter(sorted(RUNS.glob(f"*/{model}/seed_*/export"))), None)
         if export is not None:
-            import audiomoth   # measured on the device (audiomoth.py): RAM with the measured stack, max latency
+            import audiomoth   # measured on the device (audiomoth.py): max latency
             m = audiomoth.measured().get(model)
             out |= audiomoth.device_costs(model, export, m) if m else vit_memory(export)
     return out
 
 
-def vit_memory(export: Path, stack_bytes: int = 1400) -> dict:
+def vit_memory(export: Path) -> dict:
     """Flash (the model's C arrays) and static RAM (the ViT's and the front end's state) of the
-    Cortex-M4 build, plus one buffer of audio and of spectrogram and the stack (default: 1.4 KB, an
-    earlier measurement; audiomoth.py gives each model's own)."""
+    Cortex-M4 build, plus one buffer of audio and of spectrogram. The stack is left out: the firmware's
+    own, shared with everything it runs (audiomoth.py measures its depth, in results/audiomoth.csv)."""
     import export as E
     sizes = {}
     with tempfile.TemporaryDirectory() as tmp:
@@ -204,7 +204,7 @@ def vit_memory(export: Path, stack_bytes: int = 1400) -> dict:
             text, data, bss = map(int, subprocess.run(["arm-none-eabi-size", str(obj)], capture_output=True, text=True).stdout.splitlines()[1].split()[:3])
             sizes[src] = (text + data, data + bss)
     return {"flash_kb": (sizes["vit_model.c"][0] + sizes["pcen.c"][0]) / 1024,
-            "ram_kb": (sizes["vit_inference.c"][1] + sizes["frontend.c"][1] + 2 * B + 7 * 129 * 4 + stack_bytes) / 1024}
+            "ram_kb": (sizes["vit_inference.c"][1] + sizes["frontend.c"][1] + 2 * B + 7 * 129 * 4) / 1024}
 
 
 def baseline_costs(model: str, run: Path) -> dict:

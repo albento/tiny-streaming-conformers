@@ -1,4 +1,4 @@
-"""Latency and RAM of the causal ViTs measured on the AudioMoth, from the CSV files of the latency
+"""Latency (and stack depth) of the causal ViTs measured on the AudioMoth, from the CSV files of the latency
 firmware (export.py), into results/audiomoth.csv and the columns of results/costs.csv.
 
     uv run export.py --all                   # one .bin per causal ViT, into runs/audiomoth/
@@ -11,9 +11,9 @@ is pooled:
 - latency of a 64 ms buffer: front end + ViT, in cycles / clock_hz, interrupts during it included (the
   wall-clock time, what real time is about). Max and mean; real time when the max is under 64 ms and no
   buffer was skipped (a buffer completed while both buffers were still waiting);
-- RAM: evaluate.vit_memory's static RAM (the ViT's and the front end's .data + .bss, one buffer of audio
-  and of spectrogram) with the deepest stack measured on the device (stack painting: the firmware's whole
-  stack during the period, CSV writes included) in place of its 1.4 KB estimate.
+- the deepest stack (stack painting: the firmware's whole stack during the period, CSV writes
+  included), kept in results/audiomoth.csv only: costs.csv's RAM (evaluate.vit_memory: the ViT's and
+  the front end's .data + .bss, one buffer of audio and of spectrogram) leaves the stack out.
 
 results/audiomoth.csv keeps the measurements, so evaluate.py --redo writes the same costs again.
 """
@@ -72,7 +72,7 @@ def measured() -> dict[str, dict]:
 def device_costs(model: str, export: Path, m: dict) -> dict:
     """The costs.csv columns of one measured model."""
     import evaluate
-    return evaluate.vit_memory(export, stack_bytes=m["stack_max_bytes"]) | {"latency_max_ms": m["latency_max_ms"]}
+    return evaluate.vit_memory(export) | {"latency_max_ms": m["latency_max_ms"]}
 
 
 def main():
