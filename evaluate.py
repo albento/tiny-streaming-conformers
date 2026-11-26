@@ -25,8 +25,8 @@ Detection, on the SSW test days, the first 8 s of every recording left out:
   capture 80 / 90 % of the boxes, and the boxes captured with 20 / 30 % of the time.
 
 Costs per model: parameters; multiply-accumulates per second of audio, front end included (window,
-FFT, power, mel filterbank, PCEN; for the ViT the formula of vit.ViT.macs_per_buffer); flash and RAM
-(the ViT: its C compiled for the Cortex-M4, stack left out, and the max latency measured on the AudioMoth
+FFT, power, mel filterbank, PCEN; for the Conformer the formula of conformer.Conformer.macs_per_buffer); flash and RAM
+(the Conformer: its C compiled for the Cortex-M4, stack left out, and the max latency measured on the AudioMoth
 once audiomoth.py has run; PolyChirp's models: their INT8 TFLite model's weights and
 peak tensor arena, plus the 3 s of audio they need).
 """
@@ -34,7 +34,6 @@ import csv
 import json
 import math
 import os
-import re
 import subprocess
 import tempfile
 from collections import defaultdict
@@ -75,10 +74,10 @@ def classification_rows(run: Path) -> list[dict]:
 
 # --- detection ----------------------------------------------------------------------------------------
 
-def boxes(collection: str) -> dict[str, np.ndarray]:
-    """Per recording, the annotation boxes as buffer ranges [b0, b1), at least one buffer each."""
+def boxes() -> dict[str, np.ndarray]:
+    """Per SSW recording, the annotation boxes as buffer ranges [b0, b1), at least one buffer each."""
     out = defaultdict(list)
-    with open(DATA / collection / "annotations.csv", newline="") as fh:
+    with open(DATA / "ssw" / "annotations.csv", newline="") as fh:
         for r in csv.DictReader(fh):
             s, e = float(r["Start Time (s)"]), float(r["End Time (s)"])
             b0 = int(s / BUFFER_S)
@@ -112,49 +111,48 @@ def recorded(z: np.ndarray, threshold: float, preroll: int, tail: int) -> np.nda
     return rec
 
 
-def detection_rows(run: Path, splits: dict, box: dict) -> list[dict]:
-    meta = json.loads((run / "train.json").read_text())
-    window = meta.get("decision_span_buffers", 1)
+def detection_rows(run: Path, files: list[str], box: dict) -> list[dict]:
+    """The rows of one run on the SSW test days (split "ssw_test"): float, and INT8 for detection_stream."""
+    window = json.loads((run / "train.json").read_text())["decision_span_buffers"]
     preroll, tail = max(round(PREROLL_S / BUFFER_S), window), round(TAIL_S / BUFFER_S)
     s = np.load(run / "scores.npz")
-    rows, curves = [], {}
-    for split, files in splits.items():
-        for kind in ("float", "int8"):
-            keys = [(c, f, f"{c}/{f}/{kind}") for c, f in files]
-            if any(k not in s.files for _, _, k in keys):
-                continue
-            seg_y, seg_z = [], []
-            z_all = [s[k] for _, _, k in keys]
-            for (c, f, _), z in zip(keys, z_all):
-                starts, score = segment_scores(z, window)
-                mask = np.zeros(len(z), bool)
-                for b0, b1 in box[c].get(f, []):
-                    mask[b0:b1] = True
-                seg_y.append(mask[starts[:, None] + np.arange(SEGMENT)].any(1))
-                seg_z.append(score)
-            seg_y, seg_z = np.concatenate(seg_y), np.concatenate(seg_z)
-            thresholds = np.unique(np.nanquantile(np.concatenate(z_all), np.linspace(0.3, 0.9999, 200)))
-            curve = []   # (share of the time recorded, share of the boxes overlapped) per threshold
-            for th in thresholds:
-                rec_t = tot_t = hit = n_box = 0
-                for (c, f, _), z in zip(keys, z_all):
-                    rec = recorded(z, th, preroll, tail)
-                    b = np.minimum(box[c].get(f, np.zeros((0, 2), int)), len(z))   # a box may end in the last, partial buffer
-                    b = b[(b[:, 1] > SKIP) & (b[:, 0] < len(z))]
-                    rec_t, tot_t = rec_t + rec.sum(), tot_t + len(z) - SKIP
-                    hit += int((span_sums(np.concatenate([[0], np.cumsum(rec)]), b) > 0).sum()) if len(b) else 0
-                    n_box += len(b)
-                curve.append((rec_t / tot_t, hit / n_box))
-            share, recall = np.array(sorted(curve)).T
-            recall = np.maximum.accumulate(recall)
-            fpr, tpr, _ = roc_curve(seg_y, seg_z)
-            curves |= {f"{split}/{kind}/roc_fpr": fpr, f"{split}/{kind}/roc_tpr": tpr,
-                       f"{split}/{kind}/time_recorded": share, f"{split}/{kind}/boxes_captured": recall}
-            rows.append({"split": split, "kind": kind, "segment_auc": roc_auc_score(seg_y, seg_z),
-                         "segment_ap": average_precision_score(seg_y, seg_z),
-                         "time_for_80": float(np.interp(0.8, recall, share)) if recall[-1] >= 0.8 else np.nan,
-                         "time_for_90": float(np.interp(0.9, recall, share)) if recall[-1] >= 0.9 else np.nan,
-                         "boxes_at_20": float(np.interp(0.2, share, recall)), "boxes_at_30": float(np.interp(0.3, share, recall))})
+    rows, curves, split = [], {}, "ssw_test"
+    for kind in ("float", "int8"):
+        keys = [f"ssw/{f}/{kind}" for f in files]
+        if any(k not in s.files for k in keys):
+            continue
+        seg_y, seg_z = [], []
+        z_all = [s[k] for k in keys]
+        for f, z in zip(files, z_all):
+            starts, score = segment_scores(z, window)
+            mask = np.zeros(len(z), bool)
+            for b0, b1 in box.get(f, []):
+                mask[b0:b1] = True
+            seg_y.append(mask[starts[:, None] + np.arange(SEGMENT)].any(1))
+            seg_z.append(score)
+        seg_y, seg_z = np.concatenate(seg_y), np.concatenate(seg_z)
+        thresholds = np.unique(np.nanquantile(np.concatenate(z_all), np.linspace(0.3, 0.9999, 200)))
+        curve = []   # (share of the time recorded, share of the boxes overlapped) per threshold
+        for th in thresholds:
+            rec_t = tot_t = hit = n_box = 0
+            for f, z in zip(files, z_all):
+                rec = recorded(z, th, preroll, tail)
+                b = np.minimum(box.get(f, np.zeros((0, 2), int)), len(z))   # a box may end in the last, partial buffer
+                b = b[(b[:, 1] > SKIP) & (b[:, 0] < len(z))]
+                rec_t, tot_t = rec_t + rec.sum(), tot_t + len(z) - SKIP
+                hit += int((span_sums(np.concatenate([[0], np.cumsum(rec)]), b) > 0).sum()) if len(b) else 0
+                n_box += len(b)
+            curve.append((rec_t / tot_t, hit / n_box))
+        share, recall = np.array(sorted(curve)).T
+        recall = np.maximum.accumulate(recall)
+        fpr, tpr, _ = roc_curve(seg_y, seg_z)
+        curves |= {f"{split}/{kind}/roc_fpr": fpr, f"{split}/{kind}/roc_tpr": tpr,
+                   f"{split}/{kind}/time_recorded": share, f"{split}/{kind}/boxes_captured": recall}
+        rows.append({"split": split, "kind": kind, "segment_auc": roc_auc_score(seg_y, seg_z),
+                     "segment_ap": average_precision_score(seg_y, seg_z),
+                     "time_for_80": float(np.interp(0.8, recall, share)) if recall[-1] >= 0.8 else np.nan,
+                     "time_for_90": float(np.interp(0.9, recall, share)) if recall[-1] >= 0.9 else np.nan,
+                     "boxes_at_20": float(np.interp(0.2, share, recall)), "boxes_at_30": float(np.interp(0.3, share, recall))})
     np.savez_compressed(run / "curves.npz", **curves)   # for plot.py
     return rows
 
@@ -167,32 +165,32 @@ def stft_macs(n_fft: int, bins: int, filterbank_weights: int) -> float:
     return n_fft + n_fft * math.log2(n_fft / 2) + 2 * n_fft + 2 * (n_fft // 2 + 1) + filterbank_weights + 3 * bins
 
 
-def vit_costs(model: str, run: Path) -> dict:
+def conformer_costs(model: str) -> dict:
     import train
-    vit = train.make_vit(model, 1)
-    front = vit.frames_per_buffer * stft_macs(256, 129, 0) / BUFFER_S
-    window_tokens = 47 * vit.frames_per_buffer // vit.stem.time_stride
-    out = {"parameters": sum(p.numel() for p in vit.parameters()),
-           "macs_per_s_window": (vit.macs_per_buffer(window_tokens) * 47 + 47 * vit.frames_per_buffer * stft_macs(256, 129, 0)) / (23 * BUFFER_S)}
-    if vit.causal:
-        out["macs_per_s_stream"] = vit.macs_per_buffer(vit.context) / BUFFER_S + front
+    conformer = train.make_conformer(model, 1)
+    front = conformer.frames_per_buffer * stft_macs(256, 129, 0) / BUFFER_S
+    window_tokens = 47 * conformer.frames_per_buffer // conformer.conv_stem.time_stride
+    out = {"parameters": sum(p.numel() for p in conformer.parameters()),
+           "macs_per_s_window": (conformer.macs_per_buffer(window_tokens) * 47 + 47 * conformer.frames_per_buffer * stft_macs(256, 129, 0)) / (23 * BUFFER_S)}
+    if conformer.causal:
+        out["macs_per_s_stream"] = conformer.macs_per_buffer(conformer.context) / BUFFER_S + front
         export = next(iter(sorted(RUNS.glob(f"*/{model}/seed_*/export"))), None)
         if export is not None:
             import audiomoth   # measured on the device (audiomoth.py): max latency
             m = audiomoth.measured().get(model)
-            out |= audiomoth.device_costs(model, export, m) if m else vit_memory(export)
+            out |= audiomoth.device_costs(model, export, m) if m else conformer_memory(export)
     return out
 
 
-def vit_memory(export: Path) -> dict:
-    """Flash (the model's C arrays) and static RAM (the ViT's and the front end's state) of the
+def conformer_memory(export: Path) -> dict:
+    """Flash (the model's C arrays) and static RAM (the Conformer's and the front end's state) of the
     Cortex-M4 build, plus one buffer of audio and of spectrogram. The stack is left out: the firmware's
     own, shared with everything it runs (audiomoth.py measures its depth, in results/audiomoth.csv)."""
     import export as E
     sizes = {}
     with tempfile.TemporaryDirectory() as tmp:
-        for src in ("vit_model.c", "pcen.c", "vit_inference.c", "frontend.c"):
-            path = export / src if src in ("vit_model.c", "pcen.c") else E.FIRMWARE / src
+        for src in ("conformer_model.c", "pcen.c", "conformer_inference.c", "frontend.c"):
+            path = export / src if src in ("conformer_model.c", "pcen.c") else E.FIRMWARE / src
             obj = Path(tmp) / (src + ".o")
             try:
                 subprocess.run(["arm-none-eabi-gcc", "-c", "-O2", "-std=c99", "-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard",
@@ -203,11 +201,11 @@ def vit_memory(export: Path) -> dict:
                 return {}  # no ARM toolchain
             text, data, bss = map(int, subprocess.run(["arm-none-eabi-size", str(obj)], capture_output=True, text=True).stdout.splitlines()[1].split()[:3])
             sizes[src] = (text + data, data + bss)
-    return {"flash_kb": (sizes["vit_model.c"][0] + sizes["pcen.c"][0]) / 1024,
-            "ram_kb": (sizes["vit_inference.c"][1] + sizes["frontend.c"][1] + 2 * B + 7 * 129 * 4) / 1024}
+    return {"flash_kb": (sizes["conformer_model.c"][0] + sizes["pcen.c"][0]) / 1024,
+            "ram_kb": (sizes["conformer_inference.c"][1] + sizes["frontend.c"][1] + 2 * B + 7 * 129 * 4) / 1024}
 
 
-def baseline_costs(model: str, run: Path) -> dict:
+def baseline_costs(model: str) -> dict:
     from keras import layers
     import baselines
     from building.models.bake import analyze_tflite
@@ -291,8 +289,8 @@ def main():
     import tensorflow as tf
     tf.config.set_visible_devices([], "GPU")   # nothing here needs a GPU
     RESULTS.mkdir(exist_ok=True)
-    splits = json.loads((DATA / "splits.json").read_text()) if (DATA / "splits.json").exists() else None
-    tests = {"ssw_test": [("ssw", f) for f in splits["ssw"]["test"]]} if splits else {}
+    splits = DATA / "splits.json"
+    test_files = json.loads(splits.read_text())["ssw"]["test"] if splits.exists() else []
     box = None
     for name in ("classification", "detection"):
         path = RESULTS / f"{name}_runs.csv"
@@ -306,8 +304,8 @@ def main():
             if key in done and not args.redo and (name == "classification" or (run / "curves.npz").exists()):
                 continue   # already in the CSV (detection: and its curves for plot.py)
             if name == "detection" and box is None:
-                box = {"ssw": boxes("ssw")}
-            found = classification_rows(run) if name == "classification" else detection_rows(run, tests, box)
+                box = boxes()
+            found = classification_rows(run) if name == "classification" else detection_rows(run, test_files, box)
             rows += [dict(zip(KEYS, key)) | r for r in found]
             replaced.add(key)
             print(f"{run}: {len(found)} rows", flush=True)
@@ -317,9 +315,8 @@ def main():
     known = set(pd.read_csv(path)["model"]) if path.exists() else set()
     costs = []
     for model in sorted({run.parts[-2] for run in RUNS.glob("*/*/seed_*")} - (set() if args.redo else known)):
-        run = next(iter(sorted(RUNS.glob(f"*/{model}/seed_*"))))
-        costs.append({"model": model, **(vit_costs(model, run) if re.match(r"vit_", model) else
-                                         wrennet_costs() if model == "wrennet" else baseline_costs(model, run))})
+        costs.append({"model": model, **(conformer_costs(model) if model.startswith("conf_") else
+                                         wrennet_costs() if model == "wrennet" else baseline_costs(model))})
     merge(path, costs, ["model"], {(c["model"],) for c in costs})
 
 if __name__ == "__main__":

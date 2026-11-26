@@ -1,6 +1,6 @@
 /****************************************************************************
  * frontend.h
- * The ViT's front end on the AudioMoth and on the host: STFT + learned PCEN
+ * The Conformer's front end on the AudioMoth and on the host: STFT + learned PCEN
  *****************************************************************************/
 
 #ifndef __FRONTEND_H

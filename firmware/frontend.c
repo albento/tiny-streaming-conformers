@@ -1,13 +1,13 @@
 /****************************************************************************
  * frontend.c
- * The ViT's front end on the AudioMoth and on the host: STFT + learned PCEN
+ * The Conformer's front end on the AudioMoth and on the host: STFT + learned PCEN
  *****************************************************************************/
 
 /* Per buffer: Hann window (constant table, stft_window.h), CMSIS-DSP's arm_rfft_fast_f32, magnitude
    with the bins below 150 Hz zeroed, then per bin PCEN with the exported parameters (pcen.c):
    (E / (M + eps)^alpha + delta)^r - delta^r, E the power, M its running mean. The two fractional
    powers use stftFastPow, an IEEE-754 bit trick (export.py reproduces it for delta^r, so that a
-   silent bin gives exactly 0); vit.py's PCEN uses exact powers in training. */
+   silent bin gives exactly 0); conformer.py's PCEN uses exact powers in training. */
 
 #include <math.h>
 #include <string.h>

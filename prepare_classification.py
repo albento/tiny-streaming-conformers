@@ -1,6 +1,6 @@
 """Builds PolyChirp's Paris dataset (the classification benchmark) with PolyChirp's own code, into the
 submodule's git-ignored folders (polychirp/raw_dataset/, polychirp/datasets/scale_49_2_r50/; or links to
-POLYCHIRP_DATA_DIR of .env), as its
+CLASSIFICATION_DATA_DIR of .env), as its
 notebook building/geographic_scale/11_scale_dataset_build.ipynb does, with three changes:
 - the 10 target species are the paper's, fixed below (the notebook picks the area's most recorded
   species, which changes as recordings are added), and so are the other species of the area, whose

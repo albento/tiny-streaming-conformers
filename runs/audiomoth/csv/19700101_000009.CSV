@@ -1,5 +1,5 @@
-# model=vit_s27_l3 depth=3 context=32 stem_time_stride=7 sample_rate=16000 clock_hz=48000000
-buffer_index,frontend_cycles,vit_cycles,isr_cycles,skipped_buffers,tokens_done,frames_done,stack_max_bytes
+# model=conf_s27_l3 depth=3 context=32 stem_time_stride=7 sample_rate=16000 clock_hz=48000000
+buffer_index,frontend_cycles,conf_cycles,isr_cycles,skipped_buffers,tokens_done,frames_done,stack_max_bytes
 0,339922,590877,70226,0,1,7,3044
 1,339895,592327,70226,0,1,7,3044
 2,339895,593598,70225,0,1,7,3044

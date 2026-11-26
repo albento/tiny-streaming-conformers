@@ -8,15 +8,15 @@ Float scores only: the comparison of the models (INT8 is evaluate.py's, to show 
 One figure per group of models, two panels side by side: left, classification precision / recall on the
 test clips, every species pooled; right, detection segment ROC on the SSW test days
 (results_<group>.png; results_<group>_zoom.png zoomed on PR_ZOOM and ROC_ZOOM). Beside it, the boxes captured against the time recorded by the simulated triggered
-recorder (trigger_<group>.png). Detection: our causal ViTs in streaming (detection_stream, the device's
+recorder (trigger_<group>.png). Detection: our causal Conformers in streaming (detection_stream, the device's
 regime), every other model on 3 s windows (detection_window). A model has the same colour everywhere;
-our ViTs solid, WrenNet dash-dot, PolyChirp's models dashed.
+our Conformers solid, WrenNet dash-dot, PolyChirp's models dashed.
 Every curve is the mean over the
 runs (each run's curve on a common grid). --ci adds its 95 %
 confidence interval as a band (Student's t, n - 1 degrees of freedom; none with one run): a check of the
 runs' spread, not a comparison of models, whose runs share their seeds (aggregate.py's *_paired.csv
 compares them seed by seed). The models are grouped as the comparisons of the paper:
-the causal ViTs with the baselines, and the non-causal ViTs with the baselines.
+the causal Conformers with the baselines, and the non-causal Conformers with the baselines.
 """
 import argparse
 import csv
@@ -42,17 +42,17 @@ SPLIT = "ssw_test"  # the detection test set (evaluate.py's curves)
 
 
 def display_name(model: str) -> str:
-    """The paper's names: vit_s24_l1 -> Conf-S2x4-L1 (_nc -> -nc), mel_polychirp_x2 -> Mel-PolyChirpx2."""
+    """The paper's names: conf_s24_l1 -> Conf-S2x4-L1 (_nc -> -nc), mel_polychirp_x2 -> Mel-PolyChirpx2."""
     if model == "wrennet":
         return "WrenNet"
     if model.startswith("mel_polychirp_"):
         return "Mel-PolyChirp" + model.removeprefix("mel_polychirp_")
-    _, stem, layers, *nc = model.split("_")   # vit_s<2><k>_l<n>[_nc]
+    _, stem, layers, *nc = model.split("_")   # conf_s<2><k>_l<n>[_nc]
     return f"Conf-S{stem[1]}x{stem[2:]}-L{layers[1:]}" + "".join(f"-{x}" for x in nc)
 
 
 def line_style(model: str) -> str:
-    """Our ViTs solid, WrenNet dash-dot, PolyChirp's models dashed."""
+    """Our Conformers solid, WrenNet dash-dot, PolyChirp's models dashed."""
     return "-." if model == "wrennet" else "--" if model.startswith("mel_polychirp") else "-"
 
 
@@ -78,7 +78,7 @@ def groups() -> dict[str, list[str]]:
     """The models of each comparison, from the classification runs."""
     models = sorted(p.name for p in (RUNS / "classification").glob("*") if p.is_dir())
     base = [m for m in models if m in BASELINES]
-    return {"causal": [m for m in models if m.startswith("vit_") and not m.endswith("_nc")] + base,
+    return {"causal": [m for m in models if m.startswith("conf_") and not m.endswith("_nc")] + base,
             "noncausal": [m for m in models if m.endswith("_nc")] + base}
 
 
@@ -87,8 +87,8 @@ def run_dirs(experiment: str, model: str) -> list[Path]:
 
 
 def detection_experiment(model: str) -> str:
-    """Our causal ViTs in streaming, every other model on 3 s windows."""
-    return "detection_stream" if model.startswith("vit_") and not model.endswith("_nc") else "detection_window"
+    """Our causal Conformers in streaming, every other model on 3 s windows."""
+    return "detection_stream" if model.startswith("conf_") and not model.endswith("_nc") else "detection_window"
 
 
 def pr_curves(model: str) -> list[np.ndarray]:

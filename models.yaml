@@ -14,8 +14,8 @@ protocol:
   patience: 10
   min_delta: 1.0e-4
 
-# Our ViT (vit.py). A model id is vit_<stem>_l<layers>[_nc]: e.g. vit_s24_l3, vit_s27_l1_nc (non-causal).
-vit:
+# Our Conformer (conformer.py). A model id is conf_<stem>_l<layers>[_nc]: e.g. conf_s24_l3, conf_s27_l1_nc (non-causal).
+conformer:
   layers: [1, 2, 3]
   stems:
     s24:   # 5x5 kernel, stride 2 (frequency) x 4 (frames): one token per 4 frames of 8 ms (~37 ms)
@@ -24,23 +24,23 @@ vit:
       {channels: 8, freq_kernel: 5, freq_stride: 2, time_kernel: 7, time_stride: 7, aligned: true}
   architecture: {dim: 32, heads: 4, ffn: 128, context: 32, conv_kernel: 7, dropout: 0.1}
   pcen_seed_clips: 2000          # PCEN's running mean starts at the mean training power (as the device)
-  readout: {tau_s: 0.5, skip: 5, temperature: 5.0}   # vit.clip_logits / vit.window_logit
+  readout: {tau_s: 0.5, skip: 5, temperature: 5.0}   # conformer.clip_logits / conformer.window_logit
   calibration_clips: 240         # INT8 calibration (export.py), drawn from the validation split
 
 # The baselines (baselines.py): PolyChirp's models, each on the front end PolyChirp assigns it, and
 # WrenNet, its authors' code (submodule wrennet/).
 baselines: [mel_polychirp_x2, mel_polychirp_x3, wrennet]
 
-# The experiments: which models each one trains (the ViT ids are expanded over stems, layers and
+# The experiments: which models each one trains (the Conformer ids are expanded over stems, layers and
 # causality as listed).
 experiments:
   classification:              # PolyChirp's Paris benchmark: 10 species, 3 s clips
-    vit: {stems: [s24, s27], causal: [true, false]}
+    conformer: {stems: [s24, s27], causal: [true, false]}
     baselines: [mel_polychirp_x2, mel_polychirp_x3, wrennet]
   detection_stream:            # bird / no bird every 64 ms, streamed as on the device (INT8)
-    vit: {stems: [s24, s27], causal: [true]}
+    conformer: {stems: [s24, s27], causal: [true]}
   detection_window:            # bird / no bird in each 3 s window, a decision every 1.47 s (float)
-    vit: {stems: [s24, s27], causal: [true, false]}
+    conformer: {stems: [s24, s27], causal: [true, false]}
     baselines: [mel_polychirp_x2, mel_polychirp_x3, wrennet]
 
 runs: 10                       # seeds 0 .. runs - 1

@@ -1,5 +1,5 @@
-# model=vit_s24_l1 depth=1 context=32 stem_time_stride=4 sample_rate=16000 clock_hz=48000000
-buffer_index,frontend_cycles,vit_cycles,isr_cycles,skipped_buffers,tokens_done,frames_done,stack_max_bytes
+# model=conf_s24_l1 depth=1 context=32 stem_time_stride=4 sample_rate=16000 clock_hz=48000000
+buffer_index,frontend_cycles,conf_cycles,isr_cycles,skipped_buffers,tokens_done,frames_done,stack_max_bytes
 0,340019,628208,78016,0,2,7,1864
 1,339900,631035,78023,0,2,7,2144
 2,339900,634759,78021,0,2,7,2144

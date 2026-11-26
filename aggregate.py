@@ -8,7 +8,7 @@
   model_b - model_a over the seeds both have, its 95 % confidence interval (Student's t), the paired
   t-test's p and its Holm correction over the pairs of the same experiment, set, kind and metric.
   detection_paired.csv also has the cost of streaming, experiment "stream_vs_window_nc": each causal
-  ViT in streaming (detection_stream, model_b) against its non-causal variant on 3 s windows
+  Conformer in streaming (detection_stream, model_b) against its non-causal variant on 3 s windows
   (detection_window, model_a = <model>_nc), its best potential; Holm over these pairs.
 
     uv run aggregate.py         # -> results/{classification,detection}_{summary,paired}.csv
@@ -44,7 +44,7 @@ def holm(p: pd.Series) -> pd.Series:
 
 
 def stream_vs_window_nc(runs: pd.DataFrame) -> pd.DataFrame:
-    """The detection runs recast as one pseudo-experiment "stream_vs_window_nc": every causal ViT of
+    """The detection runs recast as one pseudo-experiment "stream_vs_window_nc": every causal Conformer of
     detection_stream and the non-causal variant (<model>_nc) of detection_window, for paired()."""
     stream = runs[runs.experiment == "detection_stream"]
     window = runs[(runs.experiment == "detection_window") & runs.model.isin(stream.model + "_nc")]

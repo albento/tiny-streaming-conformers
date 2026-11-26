@@ -8,7 +8,7 @@ to PolyChirp, applied at run time (the submodule is never modified):
   precision (min_delta 1e-4, at most 100 epochs, patience 10; the learning-rate plateau follows it);
 - the run folders: under runs/ instead of the submodule's models/.
 
-WrenNet: its authors' PyTorch code (submodule wrennet/, unmodified), trained by train.py like the ViT
+WrenNet: its authors' PyTorch code (submodule wrennet/, unmodified), trained by train.py like the Conformer
 (PolyChirp's port of it, without the GRU, falls 0.006 macro F2 short of it).
 """
 import inspect

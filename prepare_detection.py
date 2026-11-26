@@ -4,7 +4,7 @@ fully-annotated recordings on Zenodo (Kahl et al., CC BY 4.0):
 
     uv run prepare_detection.py                 # download, convert, label, split; resumes where it stopped
 
-Into data/<name>/ (git-ignored; or DATA_DIR of .env):
+Into data/<name>/ (git-ignored; or DETECTION_DATA_DIR of .env):
   audio/*.flac, annotations.csv      the Zenodo record (MD5-checked), the audio extracted
   audio16k/<file>.npy                int16 at 16 kHz (resampled from 32 kHz), memory-mappable
   labels.npz                         one label per 64 ms buffer: 1 bird, 0 no bird, 255 uncertain

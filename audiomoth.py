@@ -1,18 +1,18 @@
-"""Latency (and stack depth) of the causal ViTs measured on the AudioMoth, from the CSV files of the latency
+"""Latency (and stack depth) of the causal Conformers measured on the AudioMoth, from the CSV files of the latency
 firmware (export.py), into results/audiomoth.csv and the columns of results/costs.csv.
 
-    uv run export.py --all                   # one .bin per causal ViT, into runs/audiomoth/
+    uv run export.py --all                   # one .bin per causal Conformer, into runs/audiomoth/
     # flash each with the AudioMoth Flash App and let it record one period or more (16 kHz and full core
     # clock whatever the configuration); it writes one CSV file per period to the SD card, in place of the WAV
     uv run audiomoth.py <folder> [<folder> ...]   # the CSV files, searched recursively
 
 Each file is assigned to a model by the model= tag of its header; every buffer of every file of a model
 is pooled:
-- latency of a 64 ms buffer: front end + ViT, in cycles / clock_hz, interrupts during it included (the
+- latency of a 64 ms buffer: front end + Conformer, in cycles / clock_hz, interrupts during it included (the
   wall-clock time, what real time is about). Max and mean; real time when the max is under 64 ms and no
   buffer was skipped (a buffer completed while both buffers were still waiting);
 - the deepest stack (stack painting: the firmware's whole stack during the period, CSV writes
-  included), kept in results/audiomoth.csv only: costs.csv's RAM (evaluate.vit_memory: the ViT's and
+  included), kept in results/audiomoth.csv only: costs.csv's RAM (evaluate.conformer_memory: the Conformer's and
   the front end's .data + .bss, one buffer of audio and of spectrogram) leaves the stack out.
 
 results/audiomoth.csv keeps the measurements, so evaluate.py --redo writes the same costs again.
@@ -38,13 +38,13 @@ def read(path: Path) -> tuple[str, pd.DataFrame] | None:
     if m is None:
         return None
     if int(m["sr"]) != 16000:
-        print(f"{path}: sample rate {m['sr']} Hz, no inference (the ViT needs 16 kHz): skipped")
+        print(f"{path}: sample rate {m['sr']} Hz, no inference (the Conformer needs 16 kHz): skipped")
         return None
     rows = pd.read_csv(path, comment="#")
     if rows.empty:
         print(f"{path}: no buffer: skipped")
         return None
-    rows["latency_ms"] = (rows.frontend_cycles + rows.vit_cycles) / int(m["clock"]) * 1000
+    rows["latency_ms"] = (rows.frontend_cycles + rows.conf_cycles) / int(m["clock"]) * 1000
     return m["tag"].split()[0], rows   # the tag: "<model>" or "<model> seed <n>"
 
 
@@ -59,7 +59,7 @@ def measure(folders: list[Path]) -> pd.DataFrame:
         b = pd.concat(parts, ignore_index=True)
         rows.append({"model": model, "files": len(parts), "buffers": len(b),
                      "latency_max_ms": b.latency_ms.max(), "latency_mean_ms": b.latency_ms.mean(),
-                     "frontend_mean_ms": (b.latency_ms * b.frontend_cycles / (b.frontend_cycles + b.vit_cycles)).mean(),
+                     "frontend_mean_ms": (b.latency_ms * b.frontend_cycles / (b.frontend_cycles + b.conf_cycles)).mean(),
                      "skipped_buffers": int(b.skipped_buffers.sum()), "stack_max_bytes": int(b.stack_max_bytes.max())})
     return pd.DataFrame(rows)
 
@@ -72,7 +72,7 @@ def measured() -> dict[str, dict]:
 def device_costs(model: str, export: Path, m: dict) -> dict:
     """The costs.csv columns of one measured model."""
     import evaluate
-    return evaluate.vit_memory(export) | {"latency_max_ms": m["latency_max_ms"]}
+    return evaluate.conformer_memory(export) | {"latency_max_ms": m["latency_max_ms"]}
 
 
 def main():

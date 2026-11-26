@@ -1,10 +1,10 @@
 /****************************************************************************
  * host_infer.c
- * The AudioMoth's ViT (frontend.c + vit_inference.c + an export of export.py) on the host
+ * The AudioMoth's Conformer (frontend.c + conformer_inference.c + an export of export.py) on the host
  *****************************************************************************/
 
 /* Streams every recording buffer by buffer exactly as the device, the front end's PCEN state and
-   the ViT's history reset at the start of each recording, and writes every buffer's logits.
+   the Conformer's history reset at the start of each recording, and writes every buffer's logits.
 
    host_infer AUDIO_IN LOGITS_OUT PCEN_INIT GAIN
      AUDIO_IN  : int32 N, int32 S (samples per recording, a multiple of 1024), int16 [N][S]
@@ -16,10 +16,10 @@
 #include <stdlib.h>
 
 #include "frontend.h"
-#include "vit_inference.h"
+#include "conformer_inference.h"
 
-#if VIT_N_BINS != FRONTEND_NUMBER_OF_BINS || VIT_INFERENCE_INPUT_FRAMES != FRONTEND_NUMBER_OF_FRAMES
-#error "vit_model.h does not match the front end"
+#if CONF_N_BINS != FRONTEND_NUMBER_OF_BINS || CONF_INFERENCE_INPUT_FRAMES != FRONTEND_NUMBER_OF_FRAMES
+#error "conformer_model.h does not match the front end"
 #endif
 
 static void fail(const char *message) {
@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
 
     header[1] = buffers;
 
-    header[2] = VIT_N_CLASSES;
+    header[2] = CONF_N_CLASSES;
 
     fwrite(header, sizeof(int32_t), 3, out);
 
@@ -62,9 +62,9 @@ int main(int argc, char **argv) {
 
     float spectrogram[FRONTEND_NUMBER_OF_FRAMES][FRONTEND_NUMBER_OF_BINS];
 
-    float logits[VIT_N_CLASSES];
+    float logits[CONF_N_CLASSES];
 
-    ViTInferenceTiming_t timing;
+    ConformerInferenceTiming_t timing;
 
     Frontend_initialise();
 
@@ -74,15 +74,15 @@ int main(int argc, char **argv) {
 
         Frontend_reset(pcenInit);
 
-        ViTInference_reset();
+        ConformerInference_reset();
 
         for (int32_t b = 0; b < buffers; b += 1) {
 
             Frontend_computeSpectrogram(audio + b * FRONTEND_BUFFER_SAMPLES, gain, spectrogram);
 
-            ViTInference_run(spectrogram, &timing, 0, logits);
+            ConformerInference_run(spectrogram, &timing, 0, logits);
 
-            fwrite(logits, sizeof(float), VIT_N_CLASSES, out);
+            fwrite(logits, sizeof(float), CONF_N_CLASSES, out);
 
         }
 

@@ -2,7 +2,7 @@
 default folders inside the repository.
 
 PolyChirp's code only knows its own folders (polychirp/raw_dataset/, polychirp/datasets/<collection>/,
-its decoded-audio cache polychirp/.cache/dataset_cache/<collection>/): when POLYCHIRP_DATA_DIR is set,
+its decoded-audio cache polychirp/.cache/dataset_cache/<collection>/): when CLASSIFICATION_DATA_DIR is set,
 link_polychirp() turns them into links to it.
 """
 import os
@@ -19,9 +19,9 @@ def folder(variable: str, default: Path | None) -> Path | None:
     return Path(value).expanduser().resolve() if value else default
 
 
-DATA = folder("DATA_DIR", ROOT / "data")
+DATA = folder("DETECTION_DATA_DIR", ROOT / "data")
 RUNS = folder("RUNS_DIR", ROOT / "runs")
-POLYCHIRP_DATA = folder("POLYCHIRP_DATA_DIR", None)
+POLYCHIRP_DATA = folder("CLASSIFICATION_DATA_DIR", None)
 
 
 def link(path: Path, target: Path) -> None:

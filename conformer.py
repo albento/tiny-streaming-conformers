@@ -1,4 +1,4 @@
-"""Our tiny streaming Conformer ("ViT" below): waveform -> one logit vector per 64 ms buffer.
+"""Our tiny streaming Conformer: waveform -> one logit vector per 64 ms buffer.
 
     waveform [B, N], 16 kHz, int16 scale
       -> front end: STFT restarted at every 1024-sample buffer (256 points, hop 128: 7 frames x 129
@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-BUFFER = 1024            # samples per buffer (64 ms at 16 kHz), the AudioMoth's DMA transfer
+BUFFER_SIZE = 1024            # samples per buffer (64 ms at 16 kHz), the AudioMoth's DMA transfer
 N_FFT, HOP = 256, 128    # 7 frames per buffer
 HIGHPASS_HZ = 150.0
 SAMPLE_RATE = 16000
@@ -64,7 +64,7 @@ class PCEN(nn.Module):
 
 
 class FrontEnd(nn.Module):
-    """Waveform [B, N] -> PCEN spectrogram [B, 129, 7 * (N // BUFFER)], the STFT restarted at every
+    """Waveform [B, N] -> PCEN spectrogram [B, 129, 7 * (N // BUFFER_SIZE)], the STFT restarted at every
     buffer (no frame spans two buffers, as on the device)."""
 
     def __init__(self):
@@ -76,8 +76,8 @@ class FrontEnd(nn.Module):
         self.pcen = PCEN(N_FFT // 2 + 1)
 
     def power(self, waveform: torch.Tensor) -> torch.Tensor:
-        n = waveform.shape[-1] // BUFFER
-        x = waveform[:, :n * BUFFER].reshape(-1, BUFFER)
+        n = waveform.shape[-1] // BUFFER_SIZE
+        x = waveform[:, :n * BUFFER_SIZE].reshape(-1, BUFFER_SIZE)
         mag = torch.stft(x, N_FFT, HOP, window=self.window, center=False, return_complex=True).abs()
         mag = mag.reshape(waveform.shape[0], n, *mag.shape[1:]).movedim(1, 2).flatten(2)  # [B, bins, n * 7]
         return (mag * self.mask) ** 2
@@ -91,7 +91,7 @@ def time_padding(kernel: int, causal: bool) -> tuple[int, int]:
     return (kernel - 1, 0) if causal else ((kernel - 1) // 2, kernel - 1 - (kernel - 1) // 2)
 
 
-class Stem(nn.Module):
+class ConvStem(nn.Module):
     """ReLU(Conv2d(1 -> channels)) over (frequency, time), one token per time_stride frames,
     flattened channel-major to channels * out_bins features. aligned: windows on the 7-frame buffers
     (time_kernel = time_stride = 7, one token per buffer, no padding)."""
@@ -111,7 +111,7 @@ class Stem(nn.Module):
         return torch.relu(self.conv(x)).flatten(1, 2)  # [B, features, tokens]
 
 
-class ConvModule(nn.Module):
+class DepthwiseConvModule(nn.Module):
     """The Conformer's convolution module (Gulati et al. 2020), reduced to what an int8 streaming
     firmware runs cheaply: LayerNorm(x + Dropout(Linear(ReLU(DepthwiseConv1d(x))))), over tokens."""
 
@@ -128,11 +128,11 @@ class ConvModule(nn.Module):
         return self.norm(x + self.dropout(self.pointwise(torch.relu(y))))
 
 
-class ViT(nn.Module):
+class Conformer(nn.Module):
     """waveform [B, N] -> buffer logits [B, N // 1024, n_classes].
 
     Args:
-        stem: Stem's arguments.
+        stem: ConvStem's arguments.
         layers: encoder layers (1 to 3 in the paper).
         causal: streamable (True) or the float reference (False).
         dim, heads, ffn, context, conv_kernel, dropout: token width, attention heads, FFN width,
@@ -144,17 +144,17 @@ class ViT(nn.Module):
         super().__init__()
         self.causal, self.context, self.n_classes = causal, context, n_classes
         self.spectrogram = FrontEnd()
-        self.stem = Stem(**stem, causal=causal)
-        self.patch_embed = nn.Linear(self.stem.out_features, dim)
+        self.conv_stem = ConvStem(**stem, causal=causal)
+        self.patch_embed = nn.Linear(self.conv_stem.out_features, dim)
         self.input_dropout = nn.Dropout(dropout)
-        self.convs = nn.ModuleList([ConvModule(dim, conv_kernel, dropout, causal) for _ in range(layers)])
+        self.convs = nn.ModuleList([DepthwiseConvModule(dim, conv_kernel, dropout, causal) for _ in range(layers)])
         self.layers = nn.ModuleList([nn.TransformerEncoderLayer(dim, heads, ffn, dropout, batch_first=True)
                                      for _ in range(layers)])
         self.embed_dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(dim, n_classes)
         # ALiBi slopes 2^(-8h / heads): 0.25, 0.0625, 0.0156, 0.0039 for 4 heads
         self.register_buffer("alibi_slopes", 2.0 ** (-8.0 / heads * torch.arange(1, heads + 1)), persistent=False)
-        self.frames_per_buffer = (BUFFER - N_FFT) // HOP + 1
+        self.frames_per_buffer = (BUFFER_SIZE - N_FFT) // HOP + 1
 
     def attention_mask(self, n: int) -> torch.Tensor:
         """[heads, n, n] additive mask: -slope * age within the causal window, -inf elsewhere; or
@@ -168,7 +168,7 @@ class ViT(nn.Module):
 
     def token_logits(self, spec: torch.Tensor) -> torch.Tensor:
         """PCEN spectrogram [B, 129, T] -> [B, tokens, n_classes]."""
-        x = self.input_dropout(self.patch_embed(self.stem(spec).transpose(1, 2)))
+        x = self.input_dropout(self.patch_embed(self.conv_stem(spec).transpose(1, 2)))
         mask = self.attention_mask(x.shape[1]).repeat(x.shape[0], 1, 1)
         # PyTorch's fused inference path mishandles 3-D masks (pytorch/pytorch#102333): use the regular one
         fastpath = torch.backends.mha.get_fastpath_enabled()
@@ -183,14 +183,14 @@ class ViT(nn.Module):
     def forward(self, waveform: torch.Tensor, m_init: torch.Tensor | None = None) -> torch.Tensor:
         spec = self.spectrogram(waveform, m_init)
         frames = spec.shape[-1]
-        z = self.token_logits(spec).repeat_interleave(self.stem.time_stride, dim=1)[:, :frames]
+        z = self.token_logits(spec).repeat_interleave(self.conv_stem.time_stride, dim=1)[:, :frames]
         return z.reshape(z.shape[0], frames // self.frames_per_buffer, self.frames_per_buffer, -1).mean(2)
 
     def receptive_field(self) -> int:
         """Buffers of past that reach a causal buffer logit: the stem's kernel, then per layer the
         convolution (kernel - 1 tokens) and the attention window (context - 1 tokens)."""
         tokens = len(self.layers) * (self.convs[0].kernel_size - 1 + self.context - 1)
-        frames = tokens * self.stem.time_stride + self.stem.conv.kernel_size[1] - 1
+        frames = tokens * self.conv_stem.time_stride + self.conv_stem.conv.kernel_size[1] - 1
         return math.ceil(frames / self.frames_per_buffer)
 
     def macs_per_buffer(self, tokens_seen: int) -> float:
@@ -199,11 +199,11 @@ class ViT(nn.Module):
         projection, FFN, classifier; LayerNorm, softmax and the front end excluded)."""
         d, ffn = self.patch_embed.out_features, self.layers[0].linear1.out_features
         keys = min(self.context, tokens_seen) if self.causal else tokens_seen
-        conv = self.stem.conv
-        per_token = (conv.out_channels * self.stem.out_bins * conv.kernel_size[0] * conv.kernel_size[1]
+        conv = self.conv_stem.conv
+        per_token = (conv.out_channels * self.conv_stem.out_bins * conv.kernel_size[0] * conv.kernel_size[1]
                      + self.patch_embed.in_features * d + d * self.n_classes
                      + len(self.layers) * (d * self.convs[0].kernel_size + d * d + 4 * d * d + 2 * keys * d + 2 * d * ffn))
-        return per_token * self.frames_per_buffer / self.stem.time_stride
+        return per_token * self.frames_per_buffer / self.conv_stem.time_stride
 
 
 # --- readouts: from buffer logits to the decisions of each task -----------------------------------
@@ -222,7 +222,7 @@ def clip_logits(z: torch.Tensor, tau_s: float = 0.5, skip: int = 5, temperature:
     tau_s) of the buffer logits z [B, buffers, k], max over buffers >= skip (the first buffers have
     less than the attention context). temperature: a smooth max (log-mean-exp) for training; None:
     the exact max (scoring)."""
-    ema = torch.einsum("ts,bsk->btk", ema_weights(z.shape[1], tau_s * SAMPLE_RATE / BUFFER).to(z), z)[:, skip:]
+    ema = torch.einsum("ts,bsk->btk", ema_weights(z.shape[1], tau_s * SAMPLE_RATE / BUFFER_SIZE).to(z), z)[:, skip:]
     if temperature is None:
         return ema.amax(dim=1)
     return (torch.logsumexp(temperature * ema, dim=1) - math.log(ema.shape[1])) / temperature

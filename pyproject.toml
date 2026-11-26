@@ -1,11 +1,11 @@
 [project]
 name = "tiny-streaming-conformers"
 version = "1.0.0"
-description = "Experiments of the paper: tiny streaming Conformers for real-time bird detection on low-resource acoustic recorders"
+description = "Experiments of the paper: Tiny Streaming Conformers for Real-Time Bioacoustic Monitoring on Resource-Constrained Microcontrollers"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "polychirp",        # the PolyChirp benchmark (git submodule): TensorFlow 2.16, its baselines, data and evaluation code
-  "torch>=2.8",       # our ViT
+  "torch>=2.8",       # our Conformer
   "keras==3.13.2",   # PolyChirp's locked version (its data pipeline fails under 3.15)
   "python-dotenv",    # the folders of .env
   "pyyaml",
